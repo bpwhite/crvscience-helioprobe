@@ -1,5 +1,7 @@
 # HelioProbe (`helioprobe` v2.3.0)
 
+![HelioProbe 3D Solar System & Spacecraft Orbit View](validation/headless_screenshot.png)
+
 Native safe-Rust (`#![forbid(unsafe_code)]`) 3D graphical space probe, orbital mechanics, gravity-assist planner, surface lander & ocean-world cryobot POV, atmospheric entry crash probe, sample-return, and public astronomy simulation game built with `eframe`/`egui` (`0.31`), `wgpu` (`24.0` WGSL custom 3D shader pipeline), `rusqlite` (bundled SQLite WAL persistence), and `ureq` live astronomical harvesters.
 
 ## Core Architecture (10 Safe-Rust Modules)

@@ -24,6 +24,14 @@ struct Cli {
     #[arg(long, default_value = "helioprobe_saves.db")]
     db: PathBuf,
 
+    /// Render an offscreen 1600x1000 RGBA PNG screenshot without opening a GUI window
+    #[arg(long)]
+    headless_screenshot: Option<PathBuf>,
+
+    /// Select preset view (1, 2, or 3) for --headless-screenshot
+    #[arg(long, default_value_t = 1)]
+    screenshot_view: u8,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -107,6 +115,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        return Ok(());
+    }
+
+    if let Some(ref out_path) = cli.headless_screenshot {
+        helioprobe::gui::render_headless_screenshot(&cli.db, out_path, cli.screenshot_view)?;
         return Ok(());
     }
 

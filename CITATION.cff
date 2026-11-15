@@ -1,9 +1,10 @@
 cff-version: 1.2.0
-message: "If you use this software, please cite both the software repository and the CRV Science Apps hub."
+message: "If you use this software or its validation datasets, please cite both the software repository and the accompanying CRV Science Apps monograph."
 type: software
 title: "HelioProbe: 3D Space Probe, Sun-Earth L2 Observatory, Comet Tail, and Cryobot Simulator"
 version: "2.3.0"
 date-released: "2026-11-15"
+doi: "10.5281/zenodo.24244083"
 url: "https://crvscience.com/apps"
 repository-code: "https://github.com/bpwhite/crvscience-helioprobe"
 license: "MIT"
@@ -17,3 +18,15 @@ keywords:
   - "Sun-Earth L2"
   - "comets"
   - "Rust"
+preferred-citation:
+  type: article
+  title: "HelioProbe: Simulating Spacecraft Orbits, Deep-Space Telescopes, and Comet Tails in 3D"
+  authors:
+    - family-names: "White"
+      given-names: "Bryan P."
+      affiliation: "CRV Science Labs"
+  year: 2026
+  journal: "CRV Science Apps Preprints"
+  doi: "10.5281/zenodo.24244083"
+  url: "https://crvscience.com/apps/preprints/helioprobe-3d-solar-system-l2"
+  notes: "Preprint ID: APP-PREPRINT-14"
