@@ -110,6 +110,21 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(in.color.rgb, clamp(aa * 1.4, 0.0, 1.0) * in.color.a);
     }
 
+    // 6: Shaded 3D Polyhedral Mesh Triangle (pre-lit Lambert + Blinn-Phong solar specular + panel bevel)
+    if (kind == 6) {
+        let edge_x = min(in.uv.x, 1.0 - in.uv.x);
+        let edge_y = min(in.uv.y, 1.0 - in.uv.y);
+        let bevel = smoothstep(0.0, 0.075, min(edge_x, edge_y));
+        let panel_shade = mix(0.84, 1.03, bevel);
+        let sheen = max(phase, 0.0) * (0.25 + 0.75 * bevel);
+        let rgb = clamp(
+            in.color.rgb * panel_shade + vec3<f32>(sheen, sheen * 0.96, sheen * 0.88),
+            vec3<f32>(0.0),
+            vec3<f32>(1.0)
+        );
+        return vec4<f32>(rgb, in.color.a);
+    }
+
     // 5: Active 5-Band Orbital Scanner Pulse Wave
     if (r > 1.0) {
         discard;

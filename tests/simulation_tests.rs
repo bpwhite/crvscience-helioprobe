@@ -17,10 +17,12 @@ use helioprobe::astrodynamics_lab::{compute_gravity_assist, compute_porkchop_gri
 use helioprobe::catalog::{bootstrap_catalog, ScanBand};
 use helioprobe::gamification::{CampaignState, SaveDatabase};
 use helioprobe::physics::{
-    compute_transfer_from_earth, kepler_position_au, solve_kepler_eccentric_anomaly,
+    body_scene_position, compute_transfer_from_earth, kepler_position_au,
+    solve_kepler_eccentric_anomaly, visual_body_radius_scene, Vec3d,
 };
 use helioprobe::probes::{ProbePhase, PropulsionBus, SpaceProbe};
 use helioprobe::public_data::parse_jpl_sbdb_json;
+use helioprobe::renderer_3d::{build_cosmos_frame, unit_world_pos, MeshBuilder3D, OrbitCamera3D};
 use helioprobe::surface_ops::{CapsulePhase, EntryProbePhase, SurfaceUnitKind};
 use serde_json::json;
 
@@ -289,4 +291,136 @@ fn sun_earth_l2_observatories_and_dynamic_comet_tails_verified() {
     state.record_launch(intercept);
     state.record_orbit_insertion(c67p);
     assert!(state.unlocked_achievements.contains("comet_tail_chaser"));
+}
+
+#[test]
+fn campaign_command_name_cryobot_descent_and_3d_surface_anchoring_verified() {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let catalog = bootstrap_catalog();
+    let europa = catalog.iter().find(|b| b.id == "europa").expect("europa");
+    let mut state = CampaignState::default();
+    assert_eq!(state.campaign_name, "HelioProbe Deep Space Command");
+
+    let mut probe = SpaceProbe::launch_from_earth(
+        1,
+        "Europa-Relay".into(),
+        PropulsionBus::RtgNuclearElectric,
+        europa,
+        &catalog,
+        state.days_since_j2000,
+    );
+    while !probe.step(0.5, 4.0) {}
+    state.record_launch(probe);
+    state.record_orbit_insertion(europa);
+
+    let (dep, _) = state
+        .deploy_surface_unit(europa, SurfaceUnitKind::OceanCryobot)
+        .expect("deploy cryobot");
+    assert!((dep.descent_progress - 0.0).abs() < 1e-9);
+
+    let unit = &mut state
+        .surface_deployments
+        .get_mut("europa")
+        .expect("europa unit")[0];
+    let mut touched_down = false;
+    for _ in 0..50 {
+        if unit.step(0.1) {
+            touched_down = true;
+            break;
+        }
+    }
+    assert!(touched_down);
+    assert!((unit.descent_progress - 1.0).abs() < 1e-9);
+
+    let body_pos = body_scene_position(europa, &catalog, state.days_since_j2000);
+    let anchor = unit_world_pos(europa, body_pos, 0, 0.0, unit.descent_progress);
+    let surface_dist = anchor.unit_pos.sub(body_pos).length();
+    assert!((surface_dist - visual_body_radius_scene(europa)).abs() < 1e-6);
+
+    let mut cam = OrbitCamera3D::default();
+    cam.up_override = Some(anchor.normal);
+    cam.target = anchor.unit_pos.add(anchor.normal.scale(anchor.rig_scale * 0.45));
+    cam.distance = (anchor.rig_scale * 4.4).clamp(0.032, 0.34);
+    cam.pitch_rad = 0.24;
+    cam.yaw_rad = 0.62;
+
+    let frame = build_cosmos_frame(
+        eframe::egui::Rect::from_min_size(eframe::egui::Pos2::ZERO, eframe::egui::vec2(1280.0, 900.0)),
+        &cam,
+        &catalog,
+        &state.probes,
+        &state.surface_deployments,
+        &state.atmospheric_probes,
+        &state.sample_capsules,
+        &BTreeSet::new(),
+        &BTreeMap::new(),
+        state.days_since_j2000,
+        0.0,
+        "europa",
+        None,
+        true,
+    );
+    assert!(
+        frame.vertex_count > 1200,
+        "Expected curved surface patch + 3D cryobot + billboard vertices, got {}",
+        frame.vertex_count
+    );
+
+    // Exercise MeshBuilder3D primitive helpers directly
+    let mut mb = MeshBuilder3D::new(&cam, 1280.0 / 900.0, Vec3d::new(0.0, 1.0, 0.0));
+    mb.add_prism(
+        anchor.unit_pos,
+        anchor.normal,
+        anchor.east,
+        8,
+        0.01,
+        0.01,
+        0.01,
+        [0.8, 0.85, 0.9],
+        1.0,
+        24.0,
+        0.3,
+        0.05,
+        true,
+        true,
+    );
+    mb.add_box(
+        anchor.unit_pos,
+        anchor.east,
+        anchor.normal,
+        anchor.north,
+        0.01,
+        0.01,
+        0.01,
+        [0.9, 0.7, 0.2],
+        1.0,
+        24.0,
+        0.3,
+        0.05,
+    );
+    mb.add_parabolic_dish(
+        anchor.unit_pos,
+        anchor.normal,
+        anchor.east,
+        10,
+        0.01,
+        0.004,
+        [0.95, 0.95, 1.0],
+        [0.3, 0.3, 0.4],
+        32.0,
+    );
+    mb.add_solar_wing(
+        anchor.unit_pos,
+        anchor.east,
+        anchor.north,
+        anchor.normal,
+        3,
+        0.01,
+        0.005,
+        0.002,
+        [0.1, 0.4, 0.9],
+        [0.7, 0.75, 0.8],
+    );
+    assert!(mb.tri_count() > 20);
 }

@@ -41,6 +41,10 @@ impl SurfaceUnitKind {
     }
 }
 
+fn default_descent_done() -> f64 {
+    1.0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SurfaceDeployment {
     pub body_id: String,
@@ -52,6 +56,20 @@ pub struct SurfaceDeployment {
     pub ice_melt_depth_km: f64,
     #[serde(default)]
     pub active_experiment_done: bool,
+    #[serde(default = "default_descent_done")]
+    pub descent_progress: f64,
+}
+
+impl SurfaceDeployment {
+    /// Advances powered orbital-to-surface descent (`0.0..=1.0` over ~4.0 s).
+    /// Returns `true` on the frame of surface touchdown.
+    pub fn step(&mut self, dt_sec: f64) -> bool {
+        if self.descent_progress >= 1.0 {
+            return false;
+        }
+        self.descent_progress = (self.descent_progress + dt_sec / 4.0).min(1.0);
+        self.descent_progress >= 1.0
+    }
 }
 
 pub const ICY_CRYOBOT_WORLDS: [&str; 12] = [
@@ -149,6 +167,7 @@ pub fn generate_lander_deployment(body: &CelestialBody) -> SurfaceDeployment {
         relay_pucks_deployed: 1,
         ice_melt_depth_km: 0.0,
         active_experiment_done: false,
+        descent_progress: 0.0,
     }
 }
 
@@ -185,6 +204,7 @@ pub fn generate_cryobot_deployment(
         relay_pucks_deployed: pucks,
         ice_melt_depth_km: depth_km,
         active_experiment_done: false,
+        descent_progress: 0.0,
     }
 }
 

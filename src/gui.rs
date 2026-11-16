@@ -34,7 +34,7 @@ use crate::public_data::{
     fetch_simbad_deep_sky,
 };
 use crate::renderer_3d::{
-    build_cosmos_frame, CosmosGpuPipeline, CosmosPaintCallback, OrbitCamera3D,
+    build_cosmos_frame, unit_world_pos, CosmosGpuPipeline, CosmosPaintCallback, OrbitCamera3D,
 };
 use crate::surface_ops::{
     has_substantial_atmosphere, supports_atmospheric_or_crash_probe, supports_ocean_cryobot,
@@ -103,6 +103,7 @@ pub struct HelioProbeApp {
     camera: OrbitCamera3D,
     desired_cam_distance: f64,
     camera_mode: CameraTrackMode,
+    lander_cam_initialized: bool,
     tracked_probe_id: Option<u64>,
     selected_body_id: String,
     selected_bus: PropulsionBus,
@@ -157,6 +158,7 @@ impl HelioProbeApp {
             camera: OrbitCamera3D::default(),
             desired_cam_distance: 78.0,
             camera_mode: CameraTrackMode::FreeSolarOverview,
+            lander_cam_initialized: false,
             tracked_probe_id: None,
             selected_body_id: "mars".into(),
             selected_bus: PropulsionBus::ChemicalCentaur,
@@ -192,6 +194,7 @@ impl HelioProbeApp {
             camera: OrbitCamera3D::default(),
             desired_cam_distance: 78.0,
             camera_mode: CameraTrackMode::FreeSolarOverview,
+            lander_cam_initialized: false,
             tracked_probe_id: None,
             selected_body_id: "mars".into(),
             selected_bus: PropulsionBus::ChemicalCentaur,
@@ -382,12 +385,34 @@ impl HelioProbeApp {
                     grams, origin_name
                 ));
             }
+
+            // Step powered orbital-to-surface Lander / Cryobot descent (~4 s)
+            let mut landed_events = Vec::new();
+            for units in self.state.surface_deployments.values_mut() {
+                for u in units {
+                    if u.step(dt) {
+                        landed_events.push((u.body_id.clone(), u.body_name.clone(), u.kind.label()));
+                    }
+                }
+            }
+            for (bid, bname, klabel) in landed_events {
+                self.active_scan_pulse = Some((bid, Instant::now()));
+                self.set_toast(format!(
+                    "Touchdown confirmed on {} — {} anchored on surface!",
+                    bname, klabel
+                ));
+            }
         }
 
         // Camera tracking update
         match self.camera_mode {
-            CameraTrackMode::FreeSolarOverview => {}
+            CameraTrackMode::FreeSolarOverview => {
+                self.camera.up_override = None;
+                self.lander_cam_initialized = false;
+            }
             CameraTrackMode::LockSelectedBody | CameraTrackMode::OrbitView => {
+                self.camera.up_override = None;
+                self.lander_cam_initialized = false;
                 if let Some(sel) = catalog.iter().find(|b| b.id == self.selected_body_id) {
                     let pos = body_scene_position_with_offsets(
                         sel,
@@ -402,6 +427,8 @@ impl HelioProbeApp {
                 }
             }
             CameraTrackMode::RideLatestProbe => {
+                self.camera.up_override = None;
+                self.lander_cam_initialized = false;
                 let tracked = self
                     .tracked_probe_id
                     .and_then(|id| self.state.probes.iter().find(|p| p.id == id))
@@ -412,14 +439,16 @@ impl HelioProbeApp {
                 }
             }
             CameraTrackMode::LanderBotView => {
-                // Ride an active atmospheric plunge if descending on this body; otherwise anchor on the planetary surface limb!
+                // Ride an active atmospheric plunge if descending on this body; otherwise lock tightly to the surface unit!
                 if let Some(active_ap) = self.state.atmospheric_probes.iter().rev().find(|ap| {
                     ap.body_id == self.selected_body_id
                         && ap.phase != EntryProbePhase::TerminalCrushOrImpact
                 }) {
+                    self.camera.up_override = None;
                     let ap_pos = active_ap.scene_position(&catalog, self.state.days_since_j2000);
-                    self.camera.target = self.camera.target.lerp(ap_pos, (dt * 10.0).min(1.0));
+                    self.camera.target = ap_pos;
                     self.desired_cam_distance = 0.11;
+                    self.camera.distance = 0.11;
                 } else if let Some(sel) = catalog.iter().find(|b| b.id == self.selected_body_id) {
                     let center = body_scene_position_with_offsets(
                         sel,
@@ -427,20 +456,44 @@ impl HelioProbeApp {
                         self.state.days_since_j2000,
                         &self.state.comet_perihelion_offsets,
                     );
-                    let r_vis = visual_body_radius_scene(sel);
-                    let limb_ang = self.anim_time_sec * 0.10;
-                    let limb_pos = center.add(Vec3d::new(
-                        r_vis * 0.92 * limb_ang.cos(),
-                        r_vis * 0.34,
-                        r_vis * 0.92 * limb_ang.sin(),
-                    ));
-                    self.camera.target = self.camera.target.lerp(limb_pos, (dt * 7.0).min(1.0));
-                    self.desired_cam_distance = (r_vis * 0.16).clamp(0.09, 0.38);
+                    let (u_idx, descent_prog) = self
+                        .state
+                        .surface_deployments
+                        .get(&sel.id)
+                        .and_then(|units| {
+                            units
+                                .last()
+                                .map(|d| (units.len().saturating_sub(1), d.descent_progress))
+                        })
+                        .unwrap_or((0, 1.0));
+                    let anchor = unit_world_pos(
+                        sel,
+                        center,
+                        u_idx,
+                        self.anim_time_sec,
+                        descent_prog,
+                    );
+                    // Zero camera-target lerp lag relative to the moon so the lander stays planted
+                    self.camera.up_override = Some(anchor.normal);
+                    self.camera.target = anchor
+                        .unit_pos
+                        .add(anchor.normal.scale(anchor.rig_scale * 0.45));
+                    if !self.lander_cam_initialized {
+                        self.desired_cam_distance = (anchor.rig_scale * 4.8).clamp(0.032, 0.36);
+                        self.camera.distance = self.desired_cam_distance;
+                        self.camera.pitch_rad = 0.40;
+                        self.camera.yaw_rad = 0.62;
+                        self.lander_cam_initialized = true;
+                    } else {
+                        self.camera.distance = self.desired_cam_distance;
+                    }
                 }
             }
         }
-        self.camera.distance +=
-            (self.desired_cam_distance - self.camera.distance) * (dt * 5.0).min(1.0);
+        if self.camera_mode != CameraTrackMode::LanderBotView {
+            self.camera.distance +=
+                (self.desired_cam_distance - self.camera.distance) * (dt * 5.0).min(1.0);
+        }
 
         // Top HUD Bar
         egui::TopBottomPanel::top("top_mission_bar").show(ctx, |ui| {
@@ -519,6 +572,7 @@ impl HelioProbeApp {
                                 let selected = self.selected_body_id == body.id;
                                 if ui.selectable_label(selected, label).clicked() {
                                     self.selected_body_id = body.id.clone();
+                                    self.lander_cam_initialized = false;
                                     if body.distance_ly > 0.0 {
                                         self.selected_bus = PropulsionBus::LaserSailFusion;
                                     } else if body.semi_major_axis_au > 8.0 {
@@ -680,7 +734,7 @@ impl HelioProbeApp {
                         .clicked()
                     {
                         self.camera_mode = CameraTrackMode::LanderBotView;
-                        self.camera.pitch_rad = 0.16;
+                        self.lander_cam_initialized = false;
                     }
                 });
 
@@ -1100,7 +1154,7 @@ impl HelioProbeApp {
                                 ui.heading(format!("Landers, Cryobots & Entry — {}", target.name));
                                 if ui.button("6. Lander / Bot POV").clicked() {
                                     self.camera_mode = CameraTrackMode::LanderBotView;
-                                    self.camera.pitch_rad = 0.16;
+                                    self.lander_cam_initialized = false;
                                 }
                             });
                             let in_orbit = self.state.has_orbiting_probe_at(&target.id);
@@ -1156,6 +1210,7 @@ impl HelioProbeApp {
                                     {
                                         Ok((dep, _)) => {
                                             self.camera_mode = CameraTrackMode::LanderBotView;
+                                            self.lander_cam_initialized = false;
                                             self.active_scan_pulse =
                                                 Some((target.id.clone(), Instant::now()));
                                             self.set_toast(dep.telemetry_headline);
@@ -1211,6 +1266,7 @@ impl HelioProbeApp {
                                     {
                                         Ok((dep, _)) => {
                                             self.camera_mode = CameraTrackMode::LanderBotView;
+                                            self.lander_cam_initialized = false;
                                             self.active_scan_pulse =
                                                 Some((target.id.clone(), Instant::now()));
                                             self.set_toast(dep.telemetry_headline);
@@ -1607,15 +1663,20 @@ impl HelioProbeApp {
                 if response.dragged() {
                     let delta = response.drag_delta();
                     self.camera.yaw_rad -= (delta.x as f64) * 0.0065;
+                    let min_pitch = if self.camera_mode == CameraTrackMode::LanderBotView {
+                        0.05
+                    } else {
+                        -1.45
+                    };
                     self.camera.pitch_rad =
-                        (self.camera.pitch_rad + (delta.y as f64) * 0.0065).clamp(-1.45, 1.45);
+                        (self.camera.pitch_rad + (delta.y as f64) * 0.0065).clamp(min_pitch, 1.45);
                 }
                 if response.hovered() {
                     let scroll = ui.input(|i| i.smooth_scroll_delta.y);
                     if scroll.abs() > 0.01 {
                         let factor = (1.0 - (scroll as f64) * 0.0022).clamp(0.82, 1.22);
                         self.desired_cam_distance =
-                            (self.desired_cam_distance * factor).clamp(0.04, 260.0);
+                            (self.desired_cam_distance * factor).clamp(0.015, 260.0);
                         self.camera.distance = self.desired_cam_distance;
                     }
                 }
@@ -1701,9 +1762,10 @@ impl HelioProbeApp {
 
                 // Live Lander / Cryobot / Entry-Probe POV HUD Overlay
                 if self.camera_mode == CameraTrackMode::LanderBotView {
+                    let hud_w = 438.0_f32.min((rect.width() - 28.0).max(240.0));
                     let hud_rect = egui::Rect::from_min_size(
-                        egui::pos2(rect.right() - 320.0, rect.top() + 14.0),
-                        egui::vec2(306.0, 92.0),
+                        egui::pos2(rect.right() - hud_w - 14.0, rect.top() + 14.0),
+                        egui::vec2(hud_w, 86.0),
                     );
                     let p = ui.painter_at(rect);
                     p.rect_filled(
@@ -1723,41 +1785,59 @@ impl HelioProbeApp {
                         .iter()
                         .rev()
                         .find(|ap| ap.body_id == self.selected_body_id);
-                    let summary_line = if let Some(ap) = active_ap {
-                        format!(
-                            "AEP-{} @ {} | Alt {:.0} km | {:.2} bar | {:.0} °C",
-                            ap.id,
-                            ap.body_name,
-                            ap.current_alt_km,
-                            ap.current_pressure_bar,
-                            ap.current_temp_c
+                    let (line1, line2) = if let Some(ap) = active_ap {
+                        (
+                            format!("AEP-{} @ {} (Atmospheric Descent)", ap.id, ap.body_name),
+                            format!(
+                                "Alt {:.0} km | {:.2} bar | {:.0} °C",
+                                ap.current_alt_km, ap.current_pressure_bar, ap.current_temp_c
+                            ),
                         )
                     } else if let Some(units) =
                         self.state.surface_deployments.get(&self.selected_body_id)
                     {
                         if let Some(u) = units.last() {
-                            format!("{}: {}", u.kind.label(), u.telemetry_headline)
+                            let status = if u.descent_progress < 1.0 {
+                                format!("POWERED DESCENT {:.0}%", u.descent_progress * 100.0)
+                            } else {
+                                "SURFACE ANCHORED • ACTIVE".to_string()
+                            };
+                            (
+                                format!("{} [{}]", u.kind.label(), status),
+                                u.telemetry_headline.clone(),
+                            )
                         } else {
-                            "Surface Recon Horizon POV (Deploy Lander/Cryobot in Landers Tab)"
-                                .to_string()
+                            (
+                                "Surface Recon Horizon POV".to_string(),
+                                "Deploy Lander or Cryobot in Landers Tab".to_string(),
+                            )
                         }
                     } else {
-                        "Surface Recon Horizon POV (Deploy Lander/Cryobot in Landers Tab)"
-                            .to_string()
+                        (
+                            "Surface Recon Horizon POV".to_string(),
+                            "Deploy Lander or Cryobot in Landers Tab".to_string(),
+                        )
                     };
                     p.text(
-                        egui::pos2(hud_rect.left() + 10.0, hud_rect.top() + 18.0),
+                        egui::pos2(hud_rect.left() + 12.0, hud_rect.top() + 18.0),
                         egui::Align2::LEFT_CENTER,
                         "6. LANDER / CRYOBOT / ENTRY POV TELEMETRY",
                         egui::FontId::proportional(11.5),
                         egui::Color32::from_rgb(95, 235, 255),
                     );
                     p.text(
-                        egui::pos2(hud_rect.left() + 10.0, hud_rect.top() + 42.0),
+                        egui::pos2(hud_rect.left() + 12.0, hud_rect.top() + 42.0),
                         egui::Align2::LEFT_CENTER,
-                        summary_line,
+                        line1,
                         egui::FontId::proportional(11.0),
                         egui::Color32::WHITE,
+                    );
+                    p.text(
+                        egui::pos2(hud_rect.left() + 12.0, hud_rect.top() + 66.0),
+                        egui::Align2::LEFT_CENTER,
+                        line2,
+                        egui::FontId::proportional(10.5),
+                        egui::Color32::from_rgb(165, 215, 240),
                     );
                 }
 
@@ -1890,13 +1970,14 @@ pub fn render_headless_screenshot(
         // View 1: Default 3D Solar System & Spacecraft Orbit view
         app.right_tab = RightTab::ScannerFacts;
         app.selected_body_id = "mars".into();
+        app.launch_probe_to_selected(&catalog);
+        if let Some(p) = app.state.probes.last_mut() {
+            p.transit_progress = 0.36;
+        }
         app.camera_mode = CameraTrackMode::FreeSolarOverview;
+        app.camera.target = Vec3d::default();
         app.camera.yaw_rad = 0.72;
         app.camera.pitch_rad = 0.44;
-        app.desired_cam_distance = 54.0;
-        app.camera.distance = 54.0;
-        app.launch_probe_to_selected(&catalog);
-        app.camera_mode = CameraTrackMode::FreeSolarOverview;
         app.desired_cam_distance = 54.0;
         app.camera.distance = 54.0;
         app.paused = true;
@@ -1908,18 +1989,24 @@ pub fn render_headless_screenshot(
         }
         if let Some(halley) = catalog.iter().find(|b| b.id == "1p_halley") {
             let _ = app.state.warp_comet_to_perihelion(halley);
-            app.selected_body_id = halley.id.clone();
-        } else {
-            app.selected_body_id = "sun_earth_l2".into();
+        }
+        app.selected_body_id = "sun_earth_l2".into();
+        if let Some(l2) = catalog.iter().find(|b| b.id == "sun_earth_l2") {
+            app.camera.target = body_scene_position_with_offsets(
+                l2,
+                &catalog,
+                app.state.days_since_j2000,
+                &app.state.comet_perihelion_offsets,
+            );
         }
         app.camera_mode = CameraTrackMode::OrbitView;
-        app.desired_cam_distance = 4.2;
-        app.camera.distance = 4.2;
-        app.camera.yaw_rad = 0.85;
+        app.desired_cam_distance = 2.6;
+        app.camera.distance = 2.6;
+        app.camera.yaw_rad = 0.75;
         app.camera.pitch_rad = 0.34;
         app.paused = true;
     } else if view == 3 {
-        // View 3: Surface Ops / Cryobot / Lander POV view on Europa
+        // View 3: Surface Ops / Grounded Cryobot POV view on Europa
         app.right_tab = RightTab::SurfaceOps;
         app.selected_body_id = "europa".into();
         if let Some(europa) = catalog.iter().find(|b| b.id == "europa") {
@@ -1938,10 +2025,14 @@ pub fn render_headless_screenshot(
             probe.phase = ProbePhase::Orbiting;
             let _ = app.state.record_launch(probe);
             let _ = app.state.deploy_surface_unit(europa, SurfaceUnitKind::OceanCryobot);
+            if let Some(units) = app.state.surface_deployments.get_mut("europa") {
+                for u in units {
+                    u.descent_progress = 1.0;
+                }
+            }
         }
         app.camera_mode = CameraTrackMode::LanderBotView;
-        app.camera.pitch_rad = 0.18;
-        app.camera.yaw_rad = 0.52;
+        app.lander_cam_initialized = false;
         app.paused = true;
     }
 

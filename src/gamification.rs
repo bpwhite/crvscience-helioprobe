@@ -220,7 +220,7 @@ pub struct CampaignState {
 impl Default for CampaignState {
     fn default() -> Self {
         Self {
-            campaign_name: "Willamette Deep Space Command".into(),
+            campaign_name: "HelioProbe Deep Space Command".into(),
             science_points: 0,
             spent_sp: 0,
             days_since_j2000: 9814.5,
@@ -582,6 +582,7 @@ impl CampaignState {
                     relay_pucks_deployed: 0,
                     ice_melt_depth_km: 0.0,
                     active_experiment_done: true,
+                    descent_progress: 1.0,
                 });
         }
         self.evaluate_achievements()
