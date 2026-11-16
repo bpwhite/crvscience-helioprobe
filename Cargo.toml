@@ -4,7 +4,7 @@ version = "2.3.0"
 edition = "2021"
 authors = ["Bryan P. White <crvscience.com>"]
 description = "Scientifically accurate native Rust 3D space probe, Sun-Earth L2 space telescopes, eccentric comets with dynamic solar-wind ion & dust tails, articulated landers/cryobots, and public astronomy simulator"
-license = "MIT"
+license = "GPL-3.0-or-later"
 
 [dependencies]
 eframe = { version = "0.31", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
