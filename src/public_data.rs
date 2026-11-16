@@ -1,3 +1,18 @@
+// Copyright (C) 2026 CRV Science Network (https://crvscience.com)
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://gnu.org>.
+
 //! Live public astronomical data harvesters and pure-Rust parsers for:
 //! 1. NASA JPL Small-Body Database (SBDB) API (`https://ssd-api.jpl.nasa.gov/sbdb.api`)
 //! 2. NASA JPL Horizons Ephemeris API (`https://ssd.jpl.nasa.gov/api/horizons.api`)

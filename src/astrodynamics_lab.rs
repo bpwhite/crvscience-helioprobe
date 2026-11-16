@@ -1,3 +1,18 @@
+// Copyright (C) 2026 CRV Science Network (https://crvscience.com)
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://gnu.org>.
+
 //! Gravity-Assist Slingshot & Porkchop Launch-Window Planner (`src/astrodynamics_lab.rs`):
 //! - Computes planetary synodic periods, current vs optimal Hohmann phase angles, and next launch window offsets.
 //! - Generates a 2D Lambert-approximated Porkchop `delta_v` contour grid (`departure_offset_days` x `flight_days`).
