@@ -70,14 +70,14 @@ pub const L2_OBSERVATORIES: [L2ObservatoryDef; 3] = [
 ];
 
 /// Computes the 3D scene position of the Sun-Earth L2 Lagrange center on the anti-sunward
-/// Sun->Earth axis (placed cleanly outside the Moon's 2.55-unit scene orbit and inside Mars).
+/// Sun->Earth axis (placed cleanly outside the Moon's 1.48-unit scene orbit and inside Mars).
 pub fn sun_earth_l2_center_scene(earth_scene: Vec3d) -> Vec3d {
     let r = earth_scene.length();
     if r < 1e-6 {
-        return Vec3d::new(19.6, 0.0, 0.0);
+        return Vec3d::new(20.7, 0.0, 0.0);
     }
     let anti_sun = earth_scene.normalized();
-    earth_scene.add(anti_sun.scale(3.15))
+    earth_scene.add(anti_sun.scale(4.25))
 }
 
 /// Evaluates a 3D Lissajous quasi-halo station-keeping position around Sun-Earth L2 (~180-day halo period).

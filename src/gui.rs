@@ -2000,10 +2000,10 @@ pub fn render_headless_screenshot(
             );
         }
         app.camera_mode = CameraTrackMode::OrbitView;
-        app.desired_cam_distance = 2.6;
-        app.camera.distance = 2.6;
-        app.camera.yaw_rad = 0.75;
-        app.camera.pitch_rad = 0.34;
+        app.desired_cam_distance = 2.10;
+        app.camera.distance = 2.10;
+        app.camera.yaw_rad = 0.88;
+        app.camera.pitch_rad = 0.32;
         app.paused = true;
     } else if view == 3 {
         // View 3: Surface Ops / Grounded Cryobot POV view on Europa

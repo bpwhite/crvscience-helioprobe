@@ -192,7 +192,7 @@ pub fn body_scene_position(
             let orbit_visual_radius = match body.id.as_str() {
                 "phobos" => 1.15,
                 "charon" => 1.25,
-                "moon" => 2.55,
+                "moon" => 1.48,
                 "triton" => 4.15,
                 "io" => 5.10,
                 "europa" => 6.30,
@@ -413,7 +413,7 @@ pub fn visual_body_radius_scene(body: &CelestialBody) -> f64 {
         BodyCategory::Star => 4.2,
         BodyCategory::Nebula => 8.5,
         BodyCategory::LagrangePoint => 0.14,
-        _ => (0.0062 * body.radius_km.max(0.2).powf(0.56)).clamp(0.045, 3.25),
+        _ => (0.0012 * body.radius_km.max(0.2).powf(0.75)).clamp(0.035, 3.25),
     }
 }
 
