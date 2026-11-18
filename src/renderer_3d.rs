@@ -22,7 +22,7 @@ use crate::l2_comets::{
     compute_comet_tail_state, sample_dust_tail_point, sun_earth_l2_halo_position, L2_OBSERVATORIES,
 };
 use crate::physics::{
-    body_scene_position, body_scene_position_with_offsets, compress_au_to_scene, kepler_position_au,
+    body_scene_position_with_offsets, compress_au_to_scene, kepler_position_au,
     visual_body_radius_scene, Vec3d,
 };
 use crate::probes::{ProbePhase, PropulsionBus, SpaceProbe};
@@ -119,7 +119,7 @@ impl OrbitCamera3D {
 }
 
 #[derive(Clone, Copy)]
-struct GpuVertex {
+pub(crate) struct GpuVertex {
     clip_pos: [f32; 2],
     uv: [f32; 2],
     color: [f32; 4],
@@ -147,7 +147,7 @@ impl GpuVertex {
     }
 }
 
-enum DepthGeom {
+pub(crate) enum DepthGeom {
     Quad { depth: f64, verts: [GpuVertex; 6] },
     Tri { depth: f64, verts: [GpuVertex; 3] },
 }
@@ -692,7 +692,7 @@ impl<'a> MeshBuilder3D<'a> {
         }
     }
 
-    pub fn flush_into(mut self, out: &mut Vec<DepthGeom>) {
+    pub(crate) fn flush_into(mut self, out: &mut Vec<DepthGeom>) {
         self.tris.sort_by(|a, b| b.depth().total_cmp(&a.depth()));
         out.append(&mut self.tris);
     }
@@ -1202,6 +1202,7 @@ fn build_surface_patch_and_unit(
 
     let is_icy = ICY_CRYOBOT_WORLDS.contains(&body.id.as_str());
     let sc = anchor.rig_scale;
+    let is_cryo_cutaway = unit.kind == SurfaceUnitKind::OceanCryobot && unit.descent_progress >= 1.0;
 
     // 1. Tessellated 3D curved surface patch directly beneath the lander / cryobot when close
     if u_depth < (r_vis * 8.0).max(2.2) {
@@ -1213,6 +1214,13 @@ fn build_surface_patch_and_unit(
         };
         let radial_rings = 7usize;
         let sectors = 24usize;
+        // For OceanCryobot, open a 110-deg front cutaway sector centered at theta = 0.95 rad
+        // (facing the default yaw = 0.62 rad camera) so the 250-deg ice shell & sub-ice ocean are visible!
+        let (theta_start, theta_span) = if is_cryo_cutaway {
+            (1.91_f64, TAU * (250.0 / 360.0))
+        } else {
+            (0.0_f64, TAU)
+        };
         let surf_pt = |r: f64, theta: f64| -> Vec3d {
             let u = r * theta.cos();
             let v = r * theta.sin();
@@ -1243,8 +1251,8 @@ fn build_surface_patch_and_unit(
                 0.98
             };
             for si in 0..sectors {
-                let t0 = (si as f64 / sectors as f64) * TAU;
-                let t1 = ((si + 1) as f64 / sectors as f64) * TAU;
+                let t0 = theta_start + (si as f64 / sectors as f64) * theta_span;
+                let t1 = theta_start + ((si + 1) as f64 / sectors as f64) * theta_span;
                 let p00 = surf_pt(r0, t0);
                 let p10 = surf_pt(r1, t0);
                 let p11 = surf_pt(r1, t1);
@@ -1284,6 +1292,182 @@ fn build_surface_patch_and_unit(
                 );
             }
         }
+
+        if is_cryo_cutaway {
+            // Geological cutaway: stratified ice-shell cross-section walls + deep liquid brine ocean slab
+            let ice_top_z = 0.0_f64;
+            let ice_mid_z = -sc * 1.15;
+            let ice_bot_z = -sc * 2.35;
+            let ocean_bot_z = -sc * 3.15;
+            let wall_outer_r = patch_r * 0.84;
+
+            // Radial cutaway cross-section walls at theta_start and theta_end
+            for &cut_theta in &[theta_start, theta_start + theta_span] {
+                let rad_dir = anchor
+                    .east
+                    .scale(cut_theta.cos())
+                    .add(anchor.north.scale(cut_theta.sin()));
+                let p_in_top = surf_pt(r_inner, cut_theta);
+                let p_out_top = surf_pt(wall_outer_r, cut_theta);
+                let p_in_mid = anchor
+                    .surface_pt
+                    .add(rad_dir.scale(r_inner))
+                    .add(anchor.normal.scale(ice_mid_z));
+                let p_out_mid = anchor
+                    .surface_pt
+                    .add(rad_dir.scale(wall_outer_r))
+                    .add(anchor.normal.scale(ice_mid_z));
+                let p_in_bot = anchor
+                    .surface_pt
+                    .add(rad_dir.scale(r_inner))
+                    .add(anchor.normal.scale(ice_bot_z));
+                let p_out_bot = anchor
+                    .surface_pt
+                    .add(rad_dir.scale(wall_outer_r))
+                    .add(anchor.normal.scale(ice_bot_z));
+                let p_in_oc = anchor
+                    .surface_pt
+                    .add(rad_dir.scale(r_inner * 0.4))
+                    .add(anchor.normal.scale(ocean_bot_z));
+                let p_out_oc = anchor
+                    .surface_pt
+                    .add(rad_dir.scale(wall_outer_r))
+                    .add(anchor.normal.scale(ocean_bot_z));
+
+                // Upper crisp glacial ice layer
+                mb.add_quad(
+                    p_in_top,
+                    p_out_top,
+                    p_out_mid,
+                    p_in_mid,
+                    [0.74, 0.88, 0.98],
+                    0.96,
+                    24.0,
+                    0.22,
+                    0.06,
+                    true,
+                    0.004,
+                );
+                // Lower fractured briny-ice shell
+                mb.add_quad(
+                    p_in_mid,
+                    p_out_mid,
+                    p_out_bot,
+                    p_in_bot,
+                    [0.38, 0.66, 0.86],
+                    0.96,
+                    20.0,
+                    0.18,
+                    0.05,
+                    true,
+                    0.004,
+                );
+                // Subsurface abyssal brine ocean wall
+                mb.add_quad(
+                    p_in_bot,
+                    p_out_bot,
+                    p_out_oc,
+                    p_in_oc,
+                    [0.06, 0.34, 0.60],
+                    0.94,
+                    30.0,
+                    0.35,
+                    0.12,
+                    true,
+                    0.004,
+                );
+            }
+
+            // Curved inner borehole ice wall & subsurface ocean cavern floor across the 250-deg arc
+            for si in 0..sectors {
+                let t0 = theta_start + (si as f64 / sectors as f64) * theta_span;
+                let t1 = theta_start + ((si + 1) as f64 / sectors as f64) * theta_span;
+                let d0 = anchor.east.scale(t0.cos()).add(anchor.north.scale(t0.sin()));
+                let d1 = anchor.east.scale(t1.cos()).add(anchor.north.scale(t1.sin()));
+
+                let w0_top = anchor.surface_pt.add(d0.scale(r_inner)).add(anchor.normal.scale(ice_top_z));
+                let w1_top = anchor.surface_pt.add(d1.scale(r_inner)).add(anchor.normal.scale(ice_top_z));
+                let w0_mid = anchor.surface_pt.add(d0.scale(r_inner)).add(anchor.normal.scale(ice_mid_z));
+                let w1_mid = anchor.surface_pt.add(d1.scale(r_inner)).add(anchor.normal.scale(ice_mid_z));
+                let w0_bot = anchor.surface_pt.add(d0.scale(r_inner * 1.15)).add(anchor.normal.scale(ice_bot_z));
+                let w1_bot = anchor.surface_pt.add(d1.scale(r_inner * 1.15)).add(anchor.normal.scale(ice_bot_z));
+
+                mb.add_quad(
+                    w0_top,
+                    w1_top,
+                    w1_mid,
+                    w0_mid,
+                    [0.54, 0.82, 0.96],
+                    0.82,
+                    28.0,
+                    0.28,
+                    0.08,
+                    true,
+                    0.003,
+                );
+                mb.add_quad(
+                    w0_mid,
+                    w1_mid,
+                    w1_bot,
+                    w0_bot,
+                    [0.24, 0.56, 0.80],
+                    0.85,
+                    28.0,
+                    0.30,
+                    0.10,
+                    true,
+                    0.003,
+                );
+            }
+
+            // Subsurface liquid brine ocean floor slab bounded strictly inside the 250-deg cutaway wedge
+            let oc_rings = 4usize;
+            let oc_sectors = 20usize;
+            let c_oc = anchor.surface_pt.add(anchor.normal.scale(ocean_bot_z));
+            for ri in 0..oc_rings {
+                let r0 = wall_outer_r * (ri as f64 / oc_rings as f64);
+                let r1 = wall_outer_r * ((ri + 1) as f64 / oc_rings as f64);
+                for si in 0..oc_sectors {
+                    let t0 = theta_start + (si as f64 / oc_sectors as f64) * theta_span;
+                    let t1 = theta_start + ((si + 1) as f64 / oc_sectors as f64) * theta_span;
+                    let d0 = anchor.east.scale(t0.cos()).add(anchor.north.scale(t0.sin()));
+                    let d1 = anchor.east.scale(t1.cos()).add(anchor.north.scale(t1.sin()));
+                    let p00 = c_oc.add(d0.scale(r0));
+                    let p10 = c_oc.add(d0.scale(r1));
+                    let p11 = c_oc.add(d1.scale(r1));
+                    let p01 = c_oc.add(d1.scale(r0));
+                    if ri == 0 {
+                        mb.add_tri_uv(
+                            c_oc,
+                            p10,
+                            p11,
+                            [[0.5, 0.5], [1.0, 0.5], [0.5, 1.0]],
+                            [0.05, 0.34, 0.62],
+                            0.95,
+                            36.0,
+                            0.45,
+                            0.18,
+                            true,
+                            0.002,
+                        );
+                    } else {
+                        mb.add_quad(
+                            p00,
+                            p10,
+                            p11,
+                            p01,
+                            [0.05, 0.34, 0.62],
+                            0.95,
+                            36.0,
+                            0.45,
+                            0.18,
+                            true,
+                            0.002,
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // 2. Model geometry per SurfaceUnitKind
@@ -1296,7 +1480,7 @@ fn build_surface_patch_and_unit(
         SurfaceUnitKind::OceanCryobot => {
             // Glowing cyan melt borehole collar & translucent sub-ice column planted on surface_pt
             if u_depth < (r_vis * 8.0).max(2.2) {
-                // Glowing cyan borehole rim on surface
+                // Glowing cyan borehole rim on surface (250-deg cutaway or full collar)
                 mb.add_prism(
                     anchor.surface_pt.add(n.scale(sc * 0.04)),
                     n,
@@ -1306,24 +1490,25 @@ fn build_surface_patch_and_unit(
                     sc * 0.74,
                     sc * 0.06,
                     [0.14, 0.92, 1.0],
-                    0.98,
+                    0.96,
                     24.0,
                     0.35,
                     0.58,
                     false,
                     false,
                 );
-                // Translucent sub-ice melt shaft extending down into the ice shell
+                // Translucent sub-ice melt shaft extending deep into the ice shell cutaway
+                let shaft_half = if is_cryo_cutaway { sc * 1.15 } else { sc * 0.68 };
                 mb.add_prism(
-                    anchor.surface_pt.sub(n.scale(sc * 0.68)),
+                    anchor.surface_pt.sub(n.scale(shaft_half)),
                     n,
                     e,
                     12,
                     sc * 0.68,
                     sc * 0.76,
-                    sc * 0.68,
+                    shaft_half,
                     [0.20, 0.74, 0.98],
-                    0.28,
+                    0.22,
                     32.0,
                     0.30,
                     0.24,
@@ -1425,50 +1610,68 @@ fn build_surface_patch_and_unit(
             );
 
             // Vertical brushed-titanium cylindrical thermal melt probe + glowing Pu-238 nosecone + relay pucks
-            let probe_top = if unit.descent_progress >= 1.0 {
-                anchor.surface_pt.sub(n.scale(sc * 0.06))
+            let probe_top = if is_cryo_cutaway {
+                anchor.surface_pt.sub(n.scale(sc * 1.18))
             } else {
                 pos.sub(n.scale(sc * 0.04))
             };
-            let probe_len = sc * 0.42;
+            let probe_len = if is_cryo_cutaway { sc * 0.68 } else { sc * 0.42 };
             let probe_c = probe_top.sub(n.scale(probe_len * 0.5));
             mb.add_prism(
                 probe_c,
                 n,
                 e,
                 12,
-                sc * 0.22,
-                sc * 0.22,
+                sc * 0.24,
+                sc * 0.24,
                 probe_len * 0.5,
                 [0.82, 0.88, 0.94],
                 1.0,
                 40.0,
                 0.55,
-                0.08,
+                0.10,
                 true,
                 true,
             );
-            // Glowing orange-red Pu-238 hemispherical/conical thermal nosecone
-            let nose_c = probe_top.sub(n.scale(probe_len + sc * 0.16));
+            // Glowing orange-red Pu-238 hemispherical/conical thermal nosecone melting into ocean interface
+            let nose_half = sc * 0.22;
+            let nose_c = probe_top.sub(n.scale(probe_len + nose_half));
             mb.add_prism(
                 nose_c,
                 n,
                 e,
                 12,
-                sc * 0.04,
-                sc * 0.22,
-                sc * 0.16,
+                sc * 0.05,
+                sc * 0.24,
+                nose_half,
                 [1.0, 0.42, 0.10],
                 1.0,
                 16.0,
                 0.25,
-                0.85,
+                0.92,
                 true,
                 true,
             );
 
             if unit.descent_progress >= 1.0 {
-                // Optical/fiber tether + 3 submerged wireless acoustic/RF relay pucks
+                // Hydrothermal melt plume beneath Pu-238 nosecone in the brine ocean
+                mb.add_prism(
+                    nose_c.sub(n.scale(sc * 0.36)),
+                    n,
+                    e,
+                    10,
+                    sc * 0.48,
+                    sc * 0.12,
+                    sc * 0.22,
+                    [0.18, 0.88, 1.0],
+                    0.62,
+                    12.0,
+                    0.15,
+                    0.75,
+                    true,
+                    true,
+                );
+                // Optical/fiber tether + 4 submerged wireless acoustic/RF relay pucks
                 let tether_top = deck_c.sub(n.scale(sc * 0.10));
                 let tether_v = probe_top.sub(tether_top);
                 mb.add_prism(
@@ -1476,33 +1679,33 @@ fn build_surface_patch_and_unit(
                     tether_v,
                     e,
                     4,
-                    sc * 0.032,
-                    sc * 0.032,
+                    sc * 0.036,
+                    sc * 0.036,
                     tether_v.length() * 0.5,
                     [0.95, 0.78, 0.28],
                     1.0,
                     22.0,
                     0.3,
-                    0.12,
+                    0.14,
                     true,
                     true,
                 );
-                for pk in 0..3 {
-                    let frac = 0.22 + 0.28 * (pk as f64);
+                for pk in 0..4 {
+                    let frac = 0.16 + 0.23 * (pk as f64);
                     let ppos = anchor.surface_pt.add(n.scale(sc * 0.08)).lerp(probe_top, frac);
                     mb.add_prism(
                         ppos,
                         n,
                         e,
                         8,
-                        sc * 0.12,
-                        sc * 0.12,
-                        sc * 0.05,
+                        sc * 0.13,
+                        sc * 0.13,
+                        sc * 0.055,
                         [0.24, 0.96, 1.0],
                         0.98,
                         24.0,
                         0.35,
-                        0.72,
+                        0.78,
                         true,
                         true,
                     );
@@ -1931,8 +2134,11 @@ pub fn build_cosmos_frame(
     let earth_scene_now = catalog
         .iter()
         .find(|b| b.id == "earth")
-        .map(|e| body_scene_position(e, catalog, days_since_j2000))
+        .map(|e| body_scene_position_with_offsets(e, catalog, days_since_j2000, comet_perihelion_offsets))
         .unwrap_or(Vec3d::new(16.45, 0.0, 0.0));
+    let cislunar_l2_closeup = earth_scene_now.sub(camera.target).length() < 7.5
+        && camera.distance > 0.6
+        && camera.distance < 12.0;
 
     // 2B. Sun-Earth L2 Lissajous Halo Loop & Deployed Space Telescopes (JWST, Roman, Comet Interceptor)
     {
@@ -2057,14 +2263,26 @@ pub fn build_cosmos_frame(
             }
         }
         if let Some((nx, ny, depth)) = camera.project(world, aspect) {
-            let base_world_size = visual_body_radius_scene(body);
+            let mut base_world_size = visual_body_radius_scene(body);
+            if cislunar_l2_closeup {
+                if body.id == "earth" || body.id == "moon" {
+                    base_world_size *= 0.30;
+                } else if body.category == BodyCategory::Planet {
+                    base_world_size *= 0.30;
+                }
+            }
             let proj_scale = (1.0 / (camera.fov_y_rad * 0.5).tan()) / depth;
             let min_px = if matches!(body.category, BodyCategory::Moon | BodyCategory::Asteroid) {
                 3.2 / height
             } else {
                 5.5 / height
             };
-            let half_h = ((base_world_size * proj_scale) as f32).clamp(min_px, 12.0);
+            let max_half_h = if body.id == selected_id && camera.distance <= 1.2 {
+                12.0_f32
+            } else {
+                0.48_f32
+            };
+            let half_h = ((base_world_size * proj_scale) as f32).clamp(min_px, max_half_h);
             let half_w = half_h / aspect_f32;
             let max_ndc_x = 1.65 + half_w.min(12.0);
             let max_ndc_y = 1.65 + half_h.min(12.0);
@@ -2184,7 +2402,11 @@ pub fn build_cosmos_frame(
                 let mut sample = probe.clone();
                 sample.transit_progress =
                     (step as f64 / steps as f64) * probe.transit_progress.max(0.04);
-                let p_world = sample.scene_position(catalog, days_since_j2000);
+                let p_world = sample.scene_position_with_offsets(
+                    catalog,
+                    days_since_j2000,
+                    comet_perihelion_offsets,
+                );
                 let proj = camera.project(p_world, aspect);
                 if let (Some(a), Some(b)) = (prev_pt, proj) {
                     if let Some(verts) = make_line_ribbon(
@@ -2207,7 +2429,11 @@ pub fn build_cosmos_frame(
             for step in 0..=48 {
                 let mut sample = probe.clone();
                 sample.orbit_phase_rad = (step as f64 / 48.0) * TAU;
-                let p_world = sample.scene_position(catalog, days_since_j2000);
+                let p_world = sample.scene_position_with_offsets(
+                    catalog,
+                    days_since_j2000,
+                    comet_perihelion_offsets,
+                );
                 let proj = camera.project(p_world, aspect);
                 if let (Some(a), Some(b)) = (prev_pt, proj) {
                     if let Some(verts) = make_line_ribbon(
@@ -2227,14 +2453,22 @@ pub fn build_cosmos_frame(
             }
         }
 
-        let probe_world = probe.scene_position(catalog, days_since_j2000);
+        let probe_world = probe.scene_position_with_offsets(
+            catalog,
+            days_since_j2000,
+            comet_perihelion_offsets,
+        );
         let mut ahead = probe.clone();
         if ahead.phase == ProbePhase::EnRoute {
             ahead.transit_progress = (ahead.transit_progress + 0.025).min(1.0);
         } else {
             ahead.orbit_phase_rad = (ahead.orbit_phase_rad + 0.08).rem_euclid(TAU);
         }
-        let ahead_world = ahead.scene_position(catalog, days_since_j2000);
+        let ahead_world = ahead.scene_position_with_offsets(
+            catalog,
+            days_since_j2000,
+            comet_perihelion_offsets,
+        );
         let fwd = ahead_world.sub(probe_world).normalized();
         let mut right_axis = fwd.cross(Vec3d::new(0.0, 1.0, 0.0));
         if right_axis.length() < 1e-6 {
@@ -2287,7 +2521,11 @@ pub fn build_cosmos_frame(
             for step in 0..=16 {
                 let mut sample = ap.clone();
                 sample.progress = (step as f64 / 16.0) * ap.progress.max(0.05);
-                let w = sample.scene_position(catalog, days_since_j2000);
+                let w = sample.scene_position_with_offsets(
+                    catalog,
+                    days_since_j2000,
+                    comet_perihelion_offsets,
+                );
                 let proj = camera.project(w, aspect);
                 if let (Some(a), Some(b)) = (prev_pt, proj) {
                     if let Some(verts) = make_line_ribbon(
@@ -2305,7 +2543,11 @@ pub fn build_cosmos_frame(
                 }
                 prev_pt = proj;
             }
-            let w_cur = ap.scene_position(catalog, days_since_j2000);
+            let w_cur = ap.scene_position_with_offsets(
+                catalog,
+                days_since_j2000,
+                comet_perihelion_offsets,
+            );
             if let Some((ax, ay, a_depth)) = camera.project(w_cur, aspect) {
                 let sz = (10.5 / height).clamp(0.01, 0.055);
                 let glow_col = if ap.phase == EntryProbePhase::HypersonicEntry {

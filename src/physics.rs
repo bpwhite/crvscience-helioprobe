@@ -151,6 +151,237 @@ pub fn kepler_position_au(
     Vec3d::new(x_ecl, z_ecl, y_ecl)
 }
 
+/// Evaluates Stumpff functions `C(z)` and `S(z)` with Taylor series continuity near `z = 0`
+/// and hyperbolic overflow protection for large negative `z`.
+pub fn stumpff_c_s(z: f64) -> (f64, f64) {
+    if !z.is_finite() {
+        return (0.5, 1.0 / 6.0);
+    }
+    if z > 1e-6 {
+        let s = z.sqrt();
+        let c_val = (1.0 - s.cos()) / z;
+        let s_val = (s - s.sin()) / (z * s);
+        (c_val, s_val)
+    } else if z < -1e-6 {
+        let s = (-z).sqrt().min(700.0);
+        let denom = s * s;
+        let c_val = (s.cosh() - 1.0) / denom;
+        let s_val = (s.sinh() - s) / (denom * s);
+        (c_val, s_val)
+    } else {
+        let c_val = 0.5 - z / 24.0 + (z * z) / 720.0 - (z * z * z) / 40_320.0;
+        let s_val = 1.0 / 6.0 - z / 120.0 + (z * z) / 5_040.0 - (z * z * z) / 362_880.0;
+        (c_val, s_val)
+    }
+}
+
+/// Computes right-handed J2000 ecliptic heliocentric state `(r_km, v_km_s)` at `days_since_j2000`.
+/// Preserves right-handedness `(r x v).z > 0` for prograde Solar System orbits (`i < 90 deg`).
+pub fn kepler_state_ecliptic_km(
+    body: &CelestialBody,
+    days_since_j2000: f64,
+    mean_anom_offset_deg: f64,
+) -> (Vec3d, Vec3d) {
+    if body.semi_major_axis_au <= 0.0 {
+        return (Vec3d::default(), Vec3d::default());
+    }
+    let a = body.semi_major_axis_au.max(0.01) * AU_KM;
+    let e = body.eccentricity.clamp(0.0, 0.999_995);
+    let p = (a * (1.0 - e * e)).max(1.0);
+    let mean_motion_rad_s = if body.orbital_period_days > 1e-6 {
+        TAU / (body.orbital_period_days * 86_400.0)
+    } else {
+        (GM_SUN_KM3_S2 / (a * a * a)).sqrt()
+    };
+    let m = (body.mean_anomaly_j2000_deg + mean_anom_offset_deg).to_radians()
+        + mean_motion_rad_s * days_since_j2000 * 86_400.0;
+    let ecc = solve_kepler_eccentric_anomaly(m, e);
+    let nu = 2.0
+        * ((1.0 + e).sqrt() * (ecc * 0.5).sin())
+            .atan2((1.0 - e).sqrt() * (ecc * 0.5).cos());
+    let r = a * (1.0 - e * ecc.cos());
+
+    let r_pf_x = r * nu.cos();
+    let r_pf_y = r * nu.sin();
+    let v_fac = (GM_SUN_KM3_S2 / p).sqrt();
+    let v_pf_x = -v_fac * nu.sin();
+    let v_pf_y = v_fac * (e + nu.cos());
+
+    let inc = body.inclination_deg.to_radians();
+    let om = body.lon_ascending_node_deg.to_radians();
+    let w = body.arg_periapsis_deg.to_radians();
+
+    let cos_om = om.cos();
+    let sin_om = om.sin();
+    let cos_w = w.cos();
+    let sin_w = w.sin();
+    let cos_i = inc.cos();
+    let sin_i = inc.sin();
+
+    // Perifocal basis vectors P_hat, Q_hat in right-handed J2000 ecliptic coordinates
+    let px = cos_om * cos_w - sin_om * sin_w * cos_i;
+    let py = sin_om * cos_w + cos_om * sin_w * cos_i;
+    let pz = sin_w * sin_i;
+
+    let qx = -cos_om * sin_w - sin_om * cos_w * cos_i;
+    let qy = -sin_om * sin_w + cos_om * cos_w * cos_i;
+    let qz = cos_w * sin_i;
+
+    let r_ecl = Vec3d::new(
+        px * r_pf_x + qx * r_pf_y,
+        py * r_pf_x + qy * r_pf_y,
+        pz * r_pf_x + qz * r_pf_y,
+    );
+    let v_ecl = Vec3d::new(
+        px * v_pf_x + qx * v_pf_y,
+        py * v_pf_x + qy * v_pf_y,
+        pz * v_pf_x + qz * v_pf_y,
+    );
+    (r_ecl, v_ecl)
+}
+
+/// Propagates a 3D Keplerian state `(r0_km, v0_km_s)` forward by `dt_sec` under `mu` via universal anomaly.
+pub fn propagate_kepler_ecliptic_km(
+    r0: Vec3d,
+    v0: Vec3d,
+    dt_sec: f64,
+    mu: f64,
+) -> (Vec3d, Vec3d) {
+    if dt_sec.abs() < 1e-9 || mu <= 0.0 {
+        return (r0, v0);
+    }
+    let r0_mag = r0.length().max(1.0);
+    let v0_mag2 = v0.dot(v0);
+    let r0_dot_v0 = r0.dot(v0);
+    let vr0 = r0_dot_v0 / r0_mag;
+    let alpha = 2.0 / r0_mag - v0_mag2 / mu;
+    let sqrt_mu = mu.sqrt();
+
+    let max_chi = if alpha < -1e-12 {
+        600.0 / (-alpha).sqrt()
+    } else {
+        f64::INFINITY
+    };
+
+    let mut chi = if alpha > 1e-12 {
+        sqrt_mu * dt_sec * alpha
+    } else if alpha < -1e-12 {
+        // Bate-Mueller-White Eq. (4.5-10) logarithmic hyperbolic initial guess
+        let a = 1.0 / alpha;
+        let sign = dt_sec.signum();
+        let denom = r0_dot_v0 + sign * (-mu * a).sqrt() * (1.0 - r0_mag * alpha);
+        let ratio = if denom.abs() > 1e-12 {
+            (-2.0 * mu * alpha * dt_sec / denom).abs().max(1e-12)
+        } else {
+            1.0
+        };
+        let log_guess = sign * (-a).sqrt() * ratio.ln();
+        if ratio > 1.5 && log_guess.is_finite() {
+            log_guess
+        } else {
+            sqrt_mu * dt_sec / r0_mag
+        }
+    } else {
+        sqrt_mu * dt_sec / r0_mag
+    };
+
+    if max_chi.is_finite() {
+        chi = chi.clamp(-max_chi, max_chi);
+    }
+
+    // f(chi) is strictly monotonically increasing with f(0) = -sqrt_mu * dt_sec.
+    // Keep the outer bound open (+/-INFINITY) until an actual evaluation establishes f > 0 / f < 0
+    // so bisection never jumps to max_chi/2 (cosh(300) overflow).
+    let (mut lo, mut hi) = if dt_sec > 0.0 {
+        (0.0_f64, f64::INFINITY)
+    } else {
+        (f64::NEG_INFINITY, 0.0_f64)
+    };
+    let max_hyp_step = if alpha < -1e-12 {
+        4.0 / (-alpha).sqrt()
+    } else {
+        f64::INFINITY
+    };
+    let f_tol = 1e-12 * (sqrt_mu * dt_sec.abs()).max(r0_mag);
+
+    for _ in 0..80 {
+        let z = alpha * chi * chi;
+        let (c, s) = stumpff_c_s(z);
+        let f_chi = (r0_mag * vr0 / sqrt_mu) * chi * chi * c
+            + (1.0 - alpha * r0_mag) * chi * chi * chi * s
+            + r0_mag * chi
+            - sqrt_mu * dt_sec;
+        let df_chi = (r0_mag * vr0 / sqrt_mu) * chi * (1.0 - z * s)
+            + (1.0 - alpha * r0_mag) * chi * chi * c
+            + r0_mag;
+        let d2f_chi = (r0_mag * vr0 / sqrt_mu) * (1.0 - z * c)
+            + (1.0 - alpha * r0_mag) * chi * (1.0 - z * s);
+
+        if !f_chi.is_finite() || !df_chi.is_finite() || !d2f_chi.is_finite() {
+            chi = if lo.is_finite() && hi.is_finite() {
+                0.5 * (lo + hi)
+            } else {
+                chi * 0.5
+            };
+            continue;
+        }
+
+        if f_chi < 0.0 {
+            if chi > lo {
+                lo = chi;
+            }
+        } else if chi < hi {
+            hi = chi;
+        }
+
+        if f_chi.abs() <= f_tol
+            || (lo.is_finite() && hi.is_finite() && (hi - lo).abs() <= 1e-13 * chi.abs().max(1.0))
+        {
+            break;
+        }
+
+        // Conway's Laguerre universal-Kepler step (n = 5)
+        let n = 5.0_f64;
+        let disc = ((n - 1.0) * (n - 1.0) * df_chi * df_chi - n * (n - 1.0) * f_chi * d2f_chi).abs();
+        let denom = df_chi + df_chi.signum() * disc.sqrt();
+        let raw_step = if denom.abs() > 1e-18 {
+            n * f_chi / denom
+        } else if df_chi.abs() > 1e-12 {
+            f_chi / df_chi
+        } else {
+            f_chi.signum() * chi.abs().max(1.0) * 0.25
+        };
+        let step = if (!lo.is_finite() || !hi.is_finite()) && max_hyp_step.is_finite() {
+            raw_step.clamp(-max_hyp_step, max_hyp_step)
+        } else {
+            raw_step
+        };
+        let cand = chi - step;
+
+        let in_bounds = cand.is_finite() && cand > lo && cand < hi && cand.abs() <= max_chi;
+        chi = if in_bounds {
+            cand
+        } else if lo.is_finite() && hi.is_finite() {
+            0.5 * (lo + hi)
+        } else if hi.is_finite() {
+            (chi - step.abs().min(max_hyp_step).max(1.0)).max(-max_chi)
+        } else {
+            (chi + step.abs().min(max_hyp_step).max(1.0)).min(max_chi)
+        };
+    }
+
+    let z = alpha * chi * chi;
+    let (c, s) = stumpff_c_s(z);
+    let f = 1.0 - (chi * chi / r0_mag) * c;
+    let g = dt_sec - (chi * chi * chi / sqrt_mu) * s;
+    let r = r0.scale(f).add(v0.scale(g));
+    let r_mag = r.length().max(1.0);
+    let f_dot = (sqrt_mu / (r_mag * r0_mag)) * (z * s - 1.0) * chi;
+    let g_dot = 1.0 - (chi * chi / r_mag) * c;
+    let v = r0.scale(f_dot).add(v0.scale(g_dot));
+    (r, v)
+}
+
 /// Compresses astronomical distances spanning 0.38 AU to 7,500 ly smoothly into interactive 3D world units
 /// while preserving orbital geometry, inclination, and true angular phase.
 pub fn compress_au_to_scene(pos_au: Vec3d) -> Vec3d {

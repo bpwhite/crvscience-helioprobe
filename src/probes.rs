@@ -20,11 +20,12 @@
 use crate::astrodynamics_lab::compute_gravity_assist;
 use crate::catalog::CelestialBody;
 use crate::physics::{
-    body_scene_position, compute_transfer_from_earth, probe_orbit_radius_scene, Vec3d,
+    body_scene_position, body_scene_position_with_offsets, compute_transfer_from_earth,
+    probe_orbit_radius_scene, Vec3d,
 };
 use crate::tech_tree::tech_speed_multiplier;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::f64::consts::TAU;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -303,9 +304,21 @@ impl SpaceProbe {
     /// Evaluates either a 1-leg Hohmann curve, a 2-leg patched-conic Gravity-Assist Slingshot curve,
     /// or an inclined 3D Keplerian capture orbit around the target body once `Orbiting`.
     pub fn scene_position(&self, catalog: &[CelestialBody], days_since_j2000: f64) -> Vec3d {
+        self.scene_position_with_offsets(catalog, days_since_j2000, &BTreeMap::new())
+    }
+
+    /// Evaluates `scene_position` while honoring any user-triggered comet perihelion offsets.
+    pub fn scene_position_with_offsets(
+        &self,
+        catalog: &[CelestialBody],
+        days_since_j2000: f64,
+        comet_offsets: &BTreeMap<String, f64>,
+    ) -> Vec3d {
         let target = catalog.iter().find(|b| b.id == self.target_id);
         let target_pos = target
-            .map(|t| body_scene_position(t, catalog, days_since_j2000))
+            .map(|t| {
+                body_scene_position_with_offsets(t, catalog, days_since_j2000, comet_offsets)
+            })
             .unwrap_or_default();
 
         match self.phase {
@@ -318,8 +331,12 @@ impl SpaceProbe {
                 let t = self.transit_progress.clamp(0.0, 1.0);
                 if let Some(aid) = self.assist_body_id.as_deref() {
                     if let Some(assist_body) = catalog.iter().find(|b| b.id == aid) {
-                        let assist_pos =
-                            body_scene_position(assist_body, catalog, days_since_j2000);
+                        let assist_pos = body_scene_position_with_offsets(
+                            assist_body,
+                            catalog,
+                            days_since_j2000,
+                            comet_offsets,
+                        );
                         if t < 0.48 {
                             return quadratic_arc(start, assist_pos, t / 0.48, 1.0);
                         } else {

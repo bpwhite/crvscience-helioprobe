@@ -19,14 +19,14 @@
 //! - Right Dock: 7-tab Science & Engineering Console (`Scanner`, `Windows`, `Landers`, `Tech Lab`, `Awards`, `Public Data`, `Saves`)
 
 use crate::astrodynamics_lab::{
-    compute_gravity_assist, compute_porkchop_grid, ASSIST_CANDIDATE_IDS,
+    compute_gravity_assist, compute_porkchop_grid_with_offsets, ASSIST_CANDIDATE_IDS,
 };
 use crate::catalog::{bootstrap_catalog, BodyCategory, CelestialBody, ScanBand};
 use crate::gamification::{CampaignState, SaveDatabase, ACHIEVEMENTS};
 use crate::l2_comets::{compute_comet_tail_state, L2_OBSERVATORIES};
 use crate::physics::{
     body_scene_position_with_offsets, compute_transfer_from_earth, probe_orbit_radius_scene,
-    visual_body_radius_scene, Vec3d,
+    Vec3d,
 };
 use crate::probes::{ProbePhase, PropulsionBus, SpaceProbe};
 use crate::public_data::{
@@ -35,6 +35,7 @@ use crate::public_data::{
 };
 use crate::renderer_3d::{
     build_cosmos_frame, unit_world_pos, CosmosGpuPipeline, CosmosPaintCallback, OrbitCamera3D,
+    ProjectedLabel,
 };
 use crate::surface_ops::{
     has_substantial_atmosphere, supports_atmospheric_or_crash_probe, supports_ocean_cryobot,
@@ -43,9 +44,11 @@ use crate::surface_ops::{
 use crate::tech_tree::{
     cryobot_points, sample_return_points, scan_band_points, TechBranch, TECH_TREE,
 };
+use chrono::{TimeZone, Utc};
 use eframe::egui;
 use eframe::egui_wgpu;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,17 +98,171 @@ fn porkchop_colormap(norm: f32) -> egui::Color32 {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ScheduledPorkchopWindow {
+    pub target_id: String,
+    pub col: usize,
+    pub row: usize,
+    pub dep_offset_days: f64,
+    pub tof_days: f64,
+    pub dv_km_s: f64,
+    pub c3_km2_s2: f64,
+}
+
+#[derive(Debug, Clone)]
+pub enum PublicDataFetchResult {
+    ImportedBody {
+        source: &'static str,
+        result: Result<CelestialBody, String>,
+    },
+    HorizonsNote(Result<String, String>),
+}
+
+/// Maps a pointer position inside `p_rect` to `(col, row)` in `PorkchopGrid`,
+/// accounting for the bottom-to-top Y-axis inversion (`y_inv = rows - 1 - r`).
+pub fn porkchop_cell_from_pointer(
+    p_rect: egui::Rect,
+    pos: egui::Pos2,
+    cols: usize,
+    rows: usize,
+) -> Option<(usize, usize)> {
+    if cols == 0 || rows == 0 || !p_rect.contains(pos) {
+        return None;
+    }
+    let nx = ((pos.x - p_rect.left()) / p_rect.width().max(1.0)).clamp(0.0, 0.999_999);
+    let ny = ((pos.y - p_rect.top()) / p_rect.height().max(1.0)).clamp(0.0, 0.999_999);
+    let col = ((nx * cols as f32).floor() as usize).min(cols - 1);
+    let row_from_top = ((ny * rows as f32).floor() as usize).min(rows - 1);
+    let row = rows - 1 - row_from_top;
+    Some((col, row))
+}
+
+/// Filters the catalog by case-insensitive substring (name, id, designation) and optional `BodyCategory`.
+pub fn filter_catalog_bodies<'a>(
+    catalog: &'a [CelestialBody],
+    query: &str,
+    category: Option<BodyCategory>,
+) -> Vec<&'a CelestialBody> {
+    let q = query.trim().to_ascii_lowercase();
+    catalog
+        .iter()
+        .filter(|b| category.map_or(true, |cat| b.category == cat))
+        .filter(|b| {
+            q.is_empty()
+                || b.name.to_ascii_lowercase().contains(&q)
+                || b.id.to_ascii_lowercase().contains(&q)
+                || b.designation.to_ascii_lowercase().contains(&q)
+        })
+        .collect()
+}
+
+pub fn export_campaign_json(state: &CampaignState, path: &Path) -> Result<(), String> {
+    let txt = serde_json::to_string_pretty(state).map_err(|e| format!("JSON serialize error: {e}"))?;
+    std::fs::write(path, txt).map_err(|e| format!("Failed writing {}: {e}", path.display()))
+}
+
+pub fn import_campaign_json(path: &Path) -> Result<CampaignState, String> {
+    let txt = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed reading {}: {e}", path.display()))?;
+    serde_json::from_str::<CampaignState>(&txt)
+        .map_err(|e| format!("Invalid campaign JSON in {}: {e}", path.display()))
+}
+
+fn j2000_days_to_utc_string(days_since_j2000: f64) -> String {
+    let secs = (days_since_j2000 * 86_400.0).round() as i64;
+    let j2000_epoch = Utc.with_ymd_and_hms(2000, 1, 1, 12, 0, 0).single();
+    if let Some(base) = j2000_epoch {
+        let dt = base + chrono::Duration::seconds(secs);
+        dt.format("%Y-%m-%d %H:%M UTC").to_string()
+    } else {
+        format!("J2000 +{days_since_j2000:.1} d")
+    }
+}
+
+/// Prioritizes and de-overlaps 3D projected screen labels inside `rect`.
+pub fn deoverlap_screen_labels<'a>(
+    labels: &'a [ProjectedLabel],
+    selected_id: &str,
+    rect: egui::Rect,
+) -> Vec<(&'a ProjectedLabel, egui::Pos2)> {
+    let mut indexed: Vec<(u8, f64, &'a ProjectedLabel)> = labels
+        .iter()
+        .map(|l| {
+            let prio = if l.body_id == selected_id && !l.text.starts_with("Probe ") {
+                0
+            } else if l.text.starts_with("Probe ")
+                || matches!(l.body_id.as_str(), "sun" | "earth" | "moon" | "sun_earth_l2")
+            {
+                1
+            } else if matches!(
+                l.body_id.as_str(),
+                "mercury" | "venus" | "mars" | "jupiter" | "saturn" | "uranus" | "neptune" | "pluto"
+            ) || l.text.starts_with("Comet ")
+            {
+                2
+            } else {
+                3
+            };
+            (prio, l.depth, l)
+        })
+        .collect();
+    indexed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
+
+    let mut placed_boxes: Vec<egui::Rect> = Vec::with_capacity(indexed.len());
+    let mut out: Vec<(&'a ProjectedLabel, egui::Pos2)> = Vec::with_capacity(indexed.len());
+
+    for (prio, _, lbl) in indexed {
+        let approx_w = (lbl.text.len() as f32 * 6.4 + 10.0).clamp(36.0, 210.0);
+        let approx_h = 15.0_f32;
+        let half_w = approx_w * 0.5;
+        let cx = lbl
+            .screen_pos
+            .x
+            .clamp(rect.left() + half_w + 4.0, (rect.right() - half_w - 4.0).max(rect.left() + half_w + 4.0));
+        let base_y = (lbl.screen_pos.y - lbl.radius_px - 6.0)
+            .clamp(rect.top() + approx_h + 4.0, (rect.bottom() - 8.0).max(rect.top() + approx_h + 4.0));
+
+        let candidates = [
+            base_y,
+            (base_y - 16.0).max(rect.top() + approx_h + 4.0),
+            (lbl.screen_pos.y + lbl.radius_px + 16.0).min(rect.bottom() - 8.0),
+        ];
+
+        let mut chosen: Option<egui::Pos2> = None;
+        for cand_y in candidates {
+            let anchor = egui::pos2(cx, cand_y);
+            let box_rect = egui::Rect::from_min_size(
+                egui::pos2(cx - half_w, cand_y - approx_h),
+                egui::vec2(approx_w, approx_h),
+            );
+            let overlaps = placed_boxes.iter().any(|b| b.intersects(box_rect));
+            if !overlaps || prio == 0 {
+                placed_boxes.push(box_rect);
+                chosen = Some(anchor);
+                break;
+            }
+        }
+        if let Some(pos) = chosen {
+            out.push((lbl, pos));
+        }
+    }
+    out
+}
+
 pub struct HelioProbeApp {
     catalog_base: Vec<CelestialBody>,
     pub state: CampaignState,
     db: Option<SaveDatabase>,
     db_path: PathBuf,
+    db_error: Option<String>,
     camera: OrbitCamera3D,
     desired_cam_distance: f64,
     camera_mode: CameraTrackMode,
     lander_cam_initialized: bool,
     tracked_probe_id: Option<u64>,
     selected_body_id: String,
+    catalog_search: String,
+    catalog_category_filter: Option<BodyCategory>,
     selected_bus: PropulsionBus,
     selected_assist_id: String,
     probe_callsign_input: String,
@@ -125,6 +282,11 @@ pub struct HelioProbeApp {
     horizons_cmd: String,
     api_status_msg: String,
     json_export_path: String,
+    scheduled_window: Option<ScheduledPorkchopWindow>,
+    pending_fetch_rx: Option<mpsc::Receiver<PublicDataFetchResult>>,
+    pending_fetch_label: Option<String>,
+    mission_log_open: bool,
+    show_about_window: bool,
 }
 
 impl HelioProbeApp {
@@ -144,7 +306,10 @@ impl HelioProbeApp {
         visuals.panel_fill = egui::Color32::from_rgb(12, 17, 29);
         cc.egui_ctx.set_visuals(visuals);
 
-        let db = SaveDatabase::open(&db_path).ok();
+        let (db, db_error) = match SaveDatabase::open(&db_path) {
+            Ok(d) => (Some(d), None),
+            Err(e) => (None, Some(e)),
+        };
         let state = db
             .as_ref()
             .and_then(|d| d.load_slot(1).ok())
@@ -155,12 +320,15 @@ impl HelioProbeApp {
             state,
             db,
             db_path,
+            db_error,
             camera: OrbitCamera3D::default(),
             desired_cam_distance: 78.0,
             camera_mode: CameraTrackMode::FreeSolarOverview,
             lander_cam_initialized: false,
             tracked_probe_id: None,
             selected_body_id: "mars".into(),
+            catalog_search: String::new(),
+            catalog_category_filter: None,
             selected_bus: PropulsionBus::ChemicalCentaur,
             selected_assist_id: "NONE".into(),
             probe_callsign_input: "CRV-Pathfinder-1".into(),
@@ -182,6 +350,11 @@ impl HelioProbeApp {
                 "Ready to query live NASA JPL, NASA Exoplanet Archive, and CDS SIMBAD endpoints."
                     .into(),
             json_export_path: "helioprobe_campaign_save.json".into(),
+            scheduled_window: None,
+            pending_fetch_rx: None,
+            pending_fetch_label: None,
+            mission_log_open: false,
+            show_about_window: false,
         }
     }
 
@@ -191,12 +364,15 @@ impl HelioProbeApp {
             state: CampaignState::default(),
             db: None,
             db_path,
+            db_error: None,
             camera: OrbitCamera3D::default(),
             desired_cam_distance: 78.0,
             camera_mode: CameraTrackMode::FreeSolarOverview,
             lander_cam_initialized: false,
             tracked_probe_id: None,
             selected_body_id: "mars".into(),
+            catalog_search: String::new(),
+            catalog_category_filter: None,
             selected_bus: PropulsionBus::ChemicalCentaur,
             selected_assist_id: "NONE".into(),
             probe_callsign_input: "CRV-Pathfinder-1".into(),
@@ -218,6 +394,11 @@ impl HelioProbeApp {
                 "Ready to query live NASA JPL, NASA Exoplanet Archive, and CDS SIMBAD endpoints."
                     .into(),
             json_export_path: "helioprobe_campaign_save.json".into(),
+            scheduled_window: None,
+            pending_fetch_rx: None,
+            pending_fetch_label: None,
+            mission_log_open: false,
+            show_about_window: false,
         }
     }
 
@@ -235,12 +416,99 @@ impl HelioProbeApp {
         self.toast_banner = Some((msg.into(), Instant::now()));
     }
 
+    pub fn poll_pending_fetch(&mut self) -> bool {
+        let Some(rx) = self.pending_fetch_rx.as_ref() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(PublicDataFetchResult::ImportedBody { source, result }) => {
+                self.pending_fetch_rx = None;
+                self.pending_fetch_label = None;
+                match result {
+                    Ok(body) => {
+                        self.selected_body_id = body.id.clone();
+                        self.api_status_msg = format!("Imported {} from {source}.", body.name);
+                        self.set_toast(self.api_status_msg.clone());
+                        self.state.register_imported_body(body);
+                    }
+                    Err(e) => {
+                        self.api_status_msg = e.clone();
+                        self.set_toast(format!("{source} error: {e}"));
+                    }
+                }
+                true
+            }
+            Ok(PublicDataFetchResult::HorizonsNote(res)) => {
+                self.pending_fetch_rx = None;
+                self.pending_fetch_label = None;
+                match res {
+                    Ok(note) => {
+                        self.api_status_msg = note;
+                        self.set_toast("JPL Horizons ephemeris note updated.");
+                    }
+                    Err(e) => {
+                        self.api_status_msg = e.clone();
+                        self.set_toast(format!("Horizons error: {e}"));
+                    }
+                }
+                true
+            }
+            Err(mpsc::TryRecvError::Empty) => false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.pending_fetch_rx = None;
+                self.pending_fetch_label = None;
+                self.api_status_msg = "Background public-data worker terminated unexpectedly.".into();
+                true
+            }
+        }
+    }
+
+    pub fn inject_fetch_receiver_for_test(
+        &mut self,
+        label: impl Into<String>,
+        rx: mpsc::Receiver<PublicDataFetchResult>,
+    ) {
+        self.pending_fetch_label = Some(label.into());
+        self.pending_fetch_rx = Some(rx);
+    }
+
+    pub fn is_public_fetch_pending(&self) -> bool {
+        self.pending_fetch_rx.is_some()
+    }
+
+    pub fn api_status_message(&self) -> &str {
+        &self.api_status_msg
+    }
+
+    fn spawn_public_fetch<F>(&mut self, ctx: &egui::Context, label: impl Into<String>, work: F)
+    where
+        F: FnOnce() -> PublicDataFetchResult + Send + 'static,
+    {
+        if self.pending_fetch_rx.is_some() {
+            return;
+        }
+        let label_str = label.into();
+        let (tx, rx) = mpsc::channel();
+        self.pending_fetch_rx = Some(rx);
+        self.pending_fetch_label = Some(label_str.clone());
+        self.api_status_msg = format!("Fetching {label_str} in background...");
+        let ctx_clone = ctx.clone();
+        std::thread::spawn(move || {
+            let res = work();
+            let _ = tx.send(res);
+            ctx_clone.request_repaint();
+        });
+    }
+
     fn launch_probe_to_selected(&mut self, catalog: &[CelestialBody]) {
         let Some(target) = catalog.iter().find(|b| b.id == self.selected_body_id) else {
             return;
         };
         let assist_body = if self.selected_assist_id != "NONE" {
-            catalog.iter().find(|b| b.id == self.selected_assist_id)
+            catalog
+                .iter()
+                .find(|b| b.id == self.selected_assist_id)
+                .filter(|ab| compute_gravity_assist(ab, target, catalog).is_some())
         } else {
             None
         };
@@ -254,7 +522,7 @@ impl HelioProbeApp {
         };
         self.probe_callsign_input = format!("CRV-Pathfinder-{}", self.state.next_probe_id);
 
-        let probe = SpaceProbe::launch_with_options(
+        let mut probe = SpaceProbe::launch_with_options(
             id,
             callsign.clone(),
             self.selected_bus,
@@ -264,6 +532,14 @@ impl HelioProbeApp {
             catalog,
             self.state.days_since_j2000,
         );
+        if assist_body.is_none() {
+            if let Some(win) = &self.scheduled_window {
+                if win.target_id == target.id {
+                    probe.total_delta_v_km_s = win.dv_km_s;
+                    probe.physical_flight_days = win.tof_days;
+                }
+            }
+        }
         let assist_label = probe.assist_body_name.clone();
         let unlocked = self.state.record_launch(probe);
         self.tracked_probe_id = Some(id);
@@ -296,6 +572,7 @@ impl eframe::App for HelioProbeApp {
 
 impl HelioProbeApp {
     pub fn ui_step(&mut self, ctx: &egui::Context) {
+        self.poll_pending_fetch();
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f64().clamp(0.0, 0.1);
         self.last_frame = now;
@@ -434,7 +711,11 @@ impl HelioProbeApp {
                     .and_then(|id| self.state.probes.iter().find(|p| p.id == id))
                     .or_else(|| self.state.probes.last());
                 if let Some(p) = tracked {
-                    let pos = p.scene_position(&catalog, self.state.days_since_j2000);
+                    let pos = p.scene_position_with_offsets(
+                        &catalog,
+                        self.state.days_since_j2000,
+                        &self.state.comet_perihelion_offsets,
+                    );
                     self.camera.target = self.camera.target.lerp(pos, (dt * 8.0).min(1.0));
                 }
             }
@@ -445,7 +726,11 @@ impl HelioProbeApp {
                         && ap.phase != EntryProbePhase::TerminalCrushOrImpact
                 }) {
                     self.camera.up_override = None;
-                    let ap_pos = active_ap.scene_position(&catalog, self.state.days_since_j2000);
+                    let ap_pos = active_ap.scene_position_with_offsets(
+                        &catalog,
+                        self.state.days_since_j2000,
+                        &self.state.comet_perihelion_offsets,
+                    );
                     self.camera.target = ap_pos;
                     self.desired_cam_distance = 0.11;
                     self.camera.distance = 0.11;
@@ -456,16 +741,20 @@ impl HelioProbeApp {
                         self.state.days_since_j2000,
                         &self.state.comet_perihelion_offsets,
                     );
-                    let (u_idx, descent_prog) = self
+                    let (u_idx, descent_prog, is_cryobot) = self
                         .state
                         .surface_deployments
                         .get(&sel.id)
                         .and_then(|units| {
-                            units
-                                .last()
-                                .map(|d| (units.len().saturating_sub(1), d.descent_progress))
+                            units.last().map(|d| {
+                                (
+                                    units.len().saturating_sub(1),
+                                    d.descent_progress,
+                                    d.kind == SurfaceUnitKind::OceanCryobot,
+                                )
+                            })
                         })
-                        .unwrap_or((0, 1.0));
+                        .unwrap_or((0, 1.0, false));
                     let anchor = unit_world_pos(
                         sel,
                         center,
@@ -475,13 +764,26 @@ impl HelioProbeApp {
                     );
                     // Zero camera-target lerp lag relative to the moon so the lander stays planted
                     self.camera.up_override = Some(anchor.normal);
-                    self.camera.target = anchor
-                        .unit_pos
-                        .add(anchor.normal.scale(anchor.rig_scale * 0.45));
+                    if is_cryobot && descent_prog >= 1.0 {
+                        self.camera.target = anchor
+                            .surface_pt
+                            .sub(anchor.normal.scale(anchor.rig_scale * 0.65));
+                    } else {
+                        self.camera.target = anchor
+                            .unit_pos
+                            .add(anchor.normal.scale(anchor.rig_scale * 0.45));
+                    }
                     if !self.lander_cam_initialized {
-                        self.desired_cam_distance = (anchor.rig_scale * 4.8).clamp(0.032, 0.36);
+                        if is_cryobot && descent_prog >= 1.0 {
+                            self.desired_cam_distance =
+                                (anchor.rig_scale * 6.4).clamp(0.05, 0.44);
+                            self.camera.pitch_rad = 0.14;
+                        } else {
+                            self.desired_cam_distance =
+                                (anchor.rig_scale * 4.8).clamp(0.032, 0.36);
+                            self.camera.pitch_rad = 0.40;
+                        }
                         self.camera.distance = self.desired_cam_distance;
-                        self.camera.pitch_rad = 0.40;
                         self.camera.yaw_rad = 0.62;
                         self.lander_cam_initialized = true;
                     } else {
@@ -544,6 +846,12 @@ impl HelioProbeApp {
                             Ok(()) => self.set_toast("Saved campaign to SQLite Slot 1."),
                             Err(e) => self.set_toast(e),
                         }
+                    } else {
+                        let msg = self
+                            .db_error
+                            .clone()
+                            .unwrap_or_else(|| "SQLite database unavailable.".to_string());
+                        self.set_toast(format!("Quick Save failed: {msg}"));
                     }
                 }
             });
@@ -555,11 +863,60 @@ impl HelioProbeApp {
             .resizable(true)
             .show(ctx, |ui| {
                 ui.heading("1. Celestial Target Catalog");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.catalog_search)
+                            .desired_width(145.0)
+                            .hint_text("Search targets..."),
+                    );
+                    if !self.catalog_search.is_empty() && ui.button("Clear").clicked() {
+                        self.catalog_search.clear();
+                    }
+                    let cat_label = self
+                        .catalog_category_filter
+                        .map_or("All Types", |c| c.label());
+                    egui::ComboBox::from_id_salt("catalog_cat_filter")
+                        .width(115.0)
+                        .selected_text(cat_label)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.catalog_category_filter, None, "All Types");
+                            for cat in [
+                                BodyCategory::Star,
+                                BodyCategory::Planet,
+                                BodyCategory::DwarfPlanet,
+                                BodyCategory::Moon,
+                                BodyCategory::Asteroid,
+                                BodyCategory::Comet,
+                                BodyCategory::LagrangePoint,
+                                BodyCategory::Exoplanet,
+                                BodyCategory::Nebula,
+                            ] {
+                                ui.selectable_value(
+                                    &mut self.catalog_category_filter,
+                                    Some(cat),
+                                    cat.label(),
+                                );
+                            }
+                        });
+                });
+                let filtered_catalog = filter_catalog_bodies(
+                    &catalog,
+                    &self.catalog_search,
+                    self.catalog_category_filter,
+                );
+                ui.small(format!(
+                    "Showing {} / {} bodies",
+                    filtered_catalog.len(),
+                    catalog.len()
+                ));
                 ui.push_id("catalog_scroll", |ui| {
                     egui::ScrollArea::vertical()
-                        .max_height(250.0)
+                        .max_height(225.0)
                         .show(ui, |ui| {
-                            for body in &catalog {
+                            if filtered_catalog.is_empty() {
+                                ui.weak("No targets match current search/filter.");
+                            }
+                            for body in filtered_catalog {
                                 let scanned_n = self.state.scanned_count_for(&body.id);
                                 let orbited = self.state.has_orbiting_probe_at(&body.id);
                                 let badge = if orbited {
@@ -603,6 +960,9 @@ impl HelioProbeApp {
                     } else {
                         None
                     };
+                    if self.selected_assist_id != "NONE" && assist_sol.is_none() {
+                        self.selected_assist_id = "NONE".into();
+                    }
 
                     ui.label(format!("Target: {} ({})", target.name, target.designation));
                     if let Some(sol) = &assist_sol {
@@ -623,6 +983,22 @@ impl HelioProbeApp {
                             xfer.capture_orbit_vel_km_s,
                             xfer.capture_altitude_km
                         ));
+                    }
+                    if let Some(win) = self.scheduled_window.clone() {
+                        if win.target_id == target.id {
+                            ui.horizontal(|ui| {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(95, 235, 255),
+                                    format!(
+                                        "Porkchop Scheduled: +{:.0} d | TOF {:.0} d | {:.2} km/s",
+                                        win.dep_offset_days, win.tof_days, win.dv_km_s
+                                    ),
+                                );
+                                if ui.small_button("Clear").clicked() {
+                                    self.scheduled_window = None;
+                                }
+                            });
+                        }
                     }
 
                     ui.horizontal(|ui| {
@@ -651,21 +1027,19 @@ impl HelioProbeApp {
                             for aid in ASSIST_CANDIDATE_IDS {
                                 if aid != target.id {
                                     if let Some(ab) = catalog.iter().find(|b| b.id == aid) {
-                                        let label = if let Some(sol) =
+                                        if let Some(sol) =
                                             compute_gravity_assist(ab, target, &catalog)
                                         {
-                                            format!(
+                                            let label = format!(
                                                 "Via {} (-{:.2} km/s, {:.1}° bend)",
                                                 ab.name, sol.dv_saved_km_s, sol.turn_angle_deg
-                                            )
-                                        } else {
-                                            format!("Via {}", ab.name)
-                                        };
-                                        ui.selectable_value(
-                                            &mut self.selected_assist_id,
-                                            aid.to_string(),
-                                            label,
-                                        );
+                                            );
+                                            ui.selectable_value(
+                                                &mut self.selected_assist_id,
+                                                aid.to_string(),
+                                                label,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -760,7 +1134,37 @@ impl HelioProbeApp {
                                     format!("Orbiting ({:.2} km/s)", p.capture_orbit_vel_km_s)
                                 }
                             };
-                            ui.label(format!("• {} -> {}: {}", p.callsign, p.target_name, status));
+                            let is_tracked = self.tracked_probe_id == Some(p.id);
+                            let resp = ui
+                                .selectable_label(
+                                    is_tracked,
+                                    format!("• {} -> {}: {}", p.callsign, p.target_name, status),
+                                )
+                                .on_hover_text("Click to focus camera and select probe target");
+                            if resp.clicked() {
+                                self.tracked_probe_id = Some(p.id);
+                                self.selected_body_id = p.target_id.clone();
+                                self.lander_cam_initialized = false;
+                                match p.phase {
+                                    ProbePhase::EnRoute => {
+                                        self.camera_mode = CameraTrackMode::RideLatestProbe;
+                                        self.desired_cam_distance = 0.36;
+                                    }
+                                    ProbePhase::Orbiting => {
+                                        self.camera_mode = CameraTrackMode::OrbitView;
+                                        if let Some(targ) =
+                                            catalog.iter().find(|b| b.id == p.target_id)
+                                        {
+                                            self.desired_cam_distance = match targ.category {
+                                                BodyCategory::Nebula => 22.0,
+                                                BodyCategory::Star => 17.5,
+                                                _ => (probe_orbit_radius_scene(targ) * 2.75)
+                                                    .max(1.45),
+                                            };
+                                        }
+                                    }
+                                }
+                            }
                         }
                     });
                 });
@@ -824,20 +1228,35 @@ impl HelioProbeApp {
                                 });
 
                             ui.separator();
-                            let can_scan_all = target.id == "earth"
-                                || self.state.has_orbiting_probe_at(&target.id);
+                            let can_scan_all = self.state.can_scan_all_bands(&target);
                             let has_starshade =
                                 self.state.unlocked_techs.contains("coronagraph_jwst");
+                            let has_jwst_l2 =
+                                self.state.deployed_l2_observatories.contains("jwst_l2");
+                            let has_roman_l2 =
+                                self.state.deployed_l2_observatories.contains("roman_l2");
                             let band_pts = scan_band_points(&self.state.unlocked_techs);
 
                             if !can_scan_all {
+                                let remote_msg = if has_jwst_l2
+                                    && matches!(
+                                        target.category,
+                                        BodyCategory::Comet
+                                            | BodyCategory::Exoplanet
+                                            | BodyCategory::Nebula
+                                            | BodyCategory::DwarfPlanet
+                                    ) {
+                                    "JWST L2 Telescope active: Optical/NIR & Thermal/Mass-Spec remote scans unlocked!"
+                                } else if has_roman_l2 {
+                                    "Roman L2 Telescope active: Optical/NIR wide-field remote scan unlocked!"
+                                } else if has_starshade {
+                                    "Starshade Coronagraph active: Optical/NIR remote pre-scan unlocked from Earth!"
+                                } else {
+                                    "Requires an orbiting probe around this body (or Sun-Earth L2 observatory deployment) to unlock orbital instrument telemetry."
+                                };
                                 ui.colored_label(
                                     egui::Color32::from_rgb(255, 195, 95),
-                                    if has_starshade {
-                                        "Starshade Coronagraph active: Optical/NIR remote pre-scan unlocked from Earth!"
-                                    } else {
-                                        "Requires an orbiting probe around this body to unlock orbital instrument telemetry."
-                                    },
+                                    remote_msg,
                                 );
                             } else if ui
                                 .button("Run Full 5-Band Instrument Sweep (+All Remaining SP)")
@@ -859,8 +1278,7 @@ impl HelioProbeApp {
                                     for band in ScanBand::ALL {
                                         let unlocked =
                                             self.state.is_band_scanned(&target.id, band);
-                                        let band_allowed = can_scan_all
-                                            || (band == ScanBand::OpticalNir && has_starshade);
+                                        let band_allowed = self.state.can_scan_band(&target, band);
                                         egui::Frame::group(ui.style()).show(ui, |ui| {
                                             ui.horizontal(|ui| {
                                                 ui.strong(band.label());
@@ -1028,10 +1446,11 @@ impl HelioProbeApp {
                             catalog.iter().find(|b| b.id == self.selected_body_id).cloned()
                         {
                             ui.heading(format!("Porkchop & Gravity-Assist Lab — {}", target.name));
-                            let grid = compute_porkchop_grid(
+                            let grid = compute_porkchop_grid_with_offsets(
                                 &target,
                                 &catalog,
                                 self.state.days_since_j2000,
+                                &self.state.comet_perihelion_offsets,
                                 28,
                                 20,
                             );
@@ -1043,8 +1462,11 @@ impl HelioProbeApp {
                             ui.colored_label(
                                 egui::Color32::from_rgb(110, 245, 185),
                                 format!(
-                                    "Optimal Window: +{:.1} d • Flight {:.1} d • Min dV {:.2} km/s",
-                                    grid.best_dep_offset_days, grid.best_tof_days, grid.min_dv_km_s
+                                    "Optimal Window: +{:.1} d • Flight {:.1} d • Min dV {:.2} km/s • C3 {:.1} km^2/s^2",
+                                    grid.best_dep_offset_days,
+                                    grid.best_tof_days,
+                                    grid.min_dv_km_s,
+                                    grid.best_c3_km2_s2
                                 ),
                             );
 
@@ -1058,7 +1480,7 @@ impl HelioProbeApp {
                             {
                                 self.state.days_since_j2000 += grid.best_dep_offset_days;
                                 self.set_toast(format!(
-                                    "Advanced ephemeris by +{:.1} d to optimal {} Hohmann alignment!",
+                                    "Advanced ephemeris by +{:.1} d to optimal {} Lambert alignment!",
                                     grid.best_dep_offset_days, target.name
                                 ));
                             }
@@ -1066,9 +1488,9 @@ impl HelioProbeApp {
                             ui.add_space(4.0);
                             let plot_w = ui.available_width().max(240.0);
                             let plot_h = 175.0;
-                            let (p_rect, _) = ui.allocate_exact_size(
+                            let (p_rect, p_resp) = ui.allocate_exact_size(
                                 egui::vec2(plot_w, plot_h),
-                                egui::Sense::hover(),
+                                egui::Sense::click_and_drag(),
                             );
                             let painter = ui.painter_at(p_rect);
                             let cell_w = p_rect.width() / (grid.cols as f32);
@@ -1097,14 +1519,146 @@ impl HelioProbeApp {
                             painter.circle_stroke(
                                 egui::pos2(bx, by),
                                 6.5,
-                                egui::Stroke::new(2.0, egui::Color32::WHITE),
+                                egui::Stroke::new(2.0_f32, egui::Color32::WHITE),
                             );
+                            if let Some(win) = &self.scheduled_window {
+                                if win.target_id == target.id && win.col < grid.cols && win.row < grid.rows {
+                                    let sx = p_rect.left() + (win.col as f32 + 0.5) * cell_w;
+                                    let sy = p_rect.top()
+                                        + ((grid.rows - 1 - win.row) as f32 + 0.5) * cell_h;
+                                    let d_sz = 6.0_f32;
+                                    painter.add(egui::Shape::closed_line(
+                                        vec![
+                                            egui::pos2(sx, sy - d_sz),
+                                            egui::pos2(sx + d_sz, sy),
+                                            egui::pos2(sx, sy + d_sz),
+                                            egui::pos2(sx - d_sz, sy),
+                                        ],
+                                        egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(95, 235, 255)),
+                                    ));
+                                }
+                            }
+
+                            if let Some(hover_pos) = p_resp.hover_pos() {
+                                if let Some((hc, hr)) =
+                                    porkchop_cell_from_pointer(p_rect, hover_pos, grid.cols, grid.rows)
+                                {
+                                    let hx = p_rect.left() + (hc as f32 + 0.5) * cell_w;
+                                    let hy = p_rect.top()
+                                        + ((grid.rows - 1 - hr) as f32 + 0.5) * cell_h;
+                                    let crosshair_stroke = egui::Stroke::new(
+                                        1.0_f32,
+                                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 165),
+                                    );
+                                    painter.line_segment(
+                                        [egui::pos2(hx, p_rect.top()), egui::pos2(hx, p_rect.bottom())],
+                                        crosshair_stroke,
+                                    );
+                                    painter.line_segment(
+                                        [egui::pos2(p_rect.left(), hy), egui::pos2(p_rect.right(), hy)],
+                                        crosshair_stroke,
+                                    );
+                                    let idx = hr * grid.cols + hc;
+                                    let dep_off = grid.dep_offsets_days[hc];
+                                    let tof = grid.tof_days[hr];
+                                    let dv = grid.dv_km_s[idx];
+                                    let c3 = grid.c3_km2_s2[idx];
+                                    let dep_utc =
+                                        j2000_days_to_utc_string(self.state.days_since_j2000 + dep_off);
+                                    p_resp.clone().on_hover_ui_at_pointer(|ui| {
+                                        ui.strong(format!("Dep: {dep_utc} (+{dep_off:.1} d)"));
+                                        ui.label(format!("TOF: {tof:.1} d | Total dV: {dv:.2} km/s"));
+                                        ui.label(format!("Departure C3: {c3:.1} km^2/s^2"));
+                                        ui.weak("Click plot to schedule this transfer window");
+                                    });
+                                }
+                            }
+
+                            if p_resp.clicked() {
+                                if let Some(click_pos) = p_resp.interact_pointer_pos() {
+                                    if let Some((cc, cr)) = porkchop_cell_from_pointer(
+                                        p_rect,
+                                        click_pos,
+                                        grid.cols,
+                                        grid.rows,
+                                    ) {
+                                        let idx = cr * grid.cols + cc;
+                                        let win = ScheduledPorkchopWindow {
+                                            target_id: target.id.clone(),
+                                            col: cc,
+                                            row: cr,
+                                            dep_offset_days: grid.dep_offsets_days[cc],
+                                            tof_days: grid.tof_days[cr],
+                                            dv_km_s: grid.dv_km_s[idx],
+                                            c3_km2_s2: grid.c3_km2_s2[idx],
+                                        };
+                                        self.set_toast(format!(
+                                            "Scheduled {} window: +{:.1} d | TOF {:.1} d | dV {:.2} km/s",
+                                            target.name, win.dep_offset_days, win.tof_days, win.dv_km_s
+                                        ));
+                                        self.scheduled_window = Some(win);
+                                    }
+                                }
+                            }
+
                             painter.rect_stroke(
                                 p_rect,
                                 2.0,
-                                egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 95, 130)),
+                                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(70, 95, 130)),
                                 egui::StrokeKind::Inside,
                             );
+
+                            let dep_end = grid.dep_offsets_days.last().copied().unwrap_or(0.0);
+                            let tof_min = grid.tof_days.first().copied().unwrap_or(0.0);
+                            let tof_max = grid.tof_days.last().copied().unwrap_or(0.0);
+                            ui.small(format!(
+                                "X: Dep +0..+{dep_end:.0} d  |  Y: TOF {tof_min:.0}..{tof_max:.0} d  |  dV {min_dv:.1}..{max_dv:.1} km/s",
+                                min_dv = grid.min_dv_km_s,
+                                max_dv = grid.max_dv_km_s
+                            ));
+                            ui.horizontal(|ui| {
+                                ui.small("dV Scale:");
+                                let (bar_rect, _) =
+                                    ui.allocate_exact_size(egui::vec2(120.0, 10.0), egui::Sense::hover());
+                                let bar_painter = ui.painter_at(bar_rect);
+                                for step in 0..24 {
+                                    let t0 = step as f32 / 24.0;
+                                    let x0 = bar_rect.left() + t0 * bar_rect.width();
+                                    let w = bar_rect.width() / 24.0 + 0.5;
+                                    bar_painter.rect_filled(
+                                        egui::Rect::from_min_size(
+                                            egui::pos2(x0, bar_rect.top()),
+                                            egui::vec2(w, bar_rect.height()),
+                                        ),
+                                        0.0,
+                                        porkchop_colormap(t0),
+                                    );
+                                }
+                                ui.small(format!("{:.1}..{:.1} km/s", grid.min_dv_km_s, grid.max_dv_km_s));
+                            });
+                            if let Some(win) = self.scheduled_window.clone() {
+                                if win.target_id == target.id {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(95, 235, 255),
+                                            format!(
+                                                "Scheduled: +{:.1} d | TOF {:.1} d | {:.2} km/s | C3 {:.1}",
+                                                win.dep_offset_days, win.tof_days, win.dv_km_s, win.c3_km2_s2
+                                            ),
+                                        );
+                                        if ui.small_button("Apply Dep to Clock").clicked() {
+                                            self.state.days_since_j2000 += win.dep_offset_days;
+                                            self.set_toast(format!(
+                                                "Applied scheduled departure (+{:.1} d) to ephemeris clock.",
+                                                win.dep_offset_days
+                                            ));
+                                        }
+                                        if ui.small_button("Clear").clicked() {
+                                            self.scheduled_window = None;
+                                        }
+                                    });
+                                }
+                            }
 
                             ui.separator();
                             ui.strong("Patched-Conic Gravity-Assist Slingshot Candidates");
@@ -1478,6 +2032,19 @@ impl HelioProbeApp {
 
                     RightTab::PublicDataImport => {
                         ui.heading("Live Public Astronomy Harvesters");
+                        let pending = self.is_public_fetch_pending();
+                        if pending {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(255, 210, 100),
+                                    format!(
+                                        "Fetching {} on background thread...",
+                                        self.pending_fetch_label.as_deref().unwrap_or("public data")
+                                    ),
+                                );
+                            });
+                        }
                         ui.separator();
 
                         ui.strong("1. NASA JPL Small-Body Database (SBDB)");
@@ -1487,16 +2054,17 @@ impl HelioProbeApp {
                         );
                         ui.horizontal(|ui| {
                             ui.text_edit_singleline(&mut self.sbdb_query);
-                            if ui.button("Import Asteroid/Comet").clicked() {
-                                match fetch_jpl_sbdb_small_body(&self.sbdb_query) {
-                                    Ok(body) => {
-                                        self.selected_body_id = body.id.clone();
-                                        self.api_status_msg =
-                                            format!("Imported {} from JPL SBDB.", body.name);
-                                        self.state.register_imported_body(body);
+                            if ui
+                                .add_enabled(!pending, egui::Button::new("Import Asteroid/Comet"))
+                                .clicked()
+                            {
+                                let q = self.sbdb_query.clone();
+                                self.spawn_public_fetch(ctx, format!("JPL SBDB ({q})"), move || {
+                                    PublicDataFetchResult::ImportedBody {
+                                        source: "JPL SBDB",
+                                        result: fetch_jpl_sbdb_small_body(&q),
                                     }
-                                    Err(e) => self.api_status_msg = e,
-                                }
+                                });
                             }
                         });
 
@@ -1508,18 +2076,19 @@ impl HelioProbeApp {
                         );
                         ui.horizontal(|ui| {
                             ui.text_edit_singleline(&mut self.exoplanet_query);
-                            if ui.button("Import Exoplanet").clicked() {
-                                match fetch_nasa_exoplanet(&self.exoplanet_query) {
-                                    Ok(body) => {
-                                        self.selected_body_id = body.id.clone();
-                                        self.api_status_msg = format!(
-                                            "Imported {} from NASA Exoplanet Archive.",
-                                            body.name
-                                        );
-                                        self.state.register_imported_body(body);
-                                    }
-                                    Err(e) => self.api_status_msg = e,
-                                }
+                            if ui
+                                .add_enabled(!pending, egui::Button::new("Import Exoplanet"))
+                                .clicked()
+                            {
+                                let q = self.exoplanet_query.clone();
+                                self.spawn_public_fetch(
+                                    ctx,
+                                    format!("NASA Exoplanet Archive ({q})"),
+                                    move || PublicDataFetchResult::ImportedBody {
+                                        source: "NASA Exoplanet Archive",
+                                        result: fetch_nasa_exoplanet(&q),
+                                    },
+                                );
                             }
                         });
 
@@ -1531,16 +2100,17 @@ impl HelioProbeApp {
                         );
                         ui.horizontal(|ui| {
                             ui.text_edit_singleline(&mut self.simbad_query);
-                            if ui.button("Import Nebula/Object").clicked() {
-                                match fetch_simbad_deep_sky(&self.simbad_query) {
-                                    Ok(body) => {
-                                        self.selected_body_id = body.id.clone();
-                                        self.api_status_msg =
-                                            format!("Imported {} from CDS SIMBAD.", body.name);
-                                        self.state.register_imported_body(body);
+                            if ui
+                                .add_enabled(!pending, egui::Button::new("Import Nebula/Object"))
+                                .clicked()
+                            {
+                                let q = self.simbad_query.clone();
+                                self.spawn_public_fetch(ctx, format!("CDS SIMBAD ({q})"), move || {
+                                    PublicDataFetchResult::ImportedBody {
+                                        source: "CDS SIMBAD",
+                                        result: fetch_simbad_deep_sky(&q),
                                     }
-                                    Err(e) => self.api_status_msg = e,
-                                }
+                                });
                             }
                         });
 
@@ -1552,11 +2122,20 @@ impl HelioProbeApp {
                         );
                         ui.horizontal(|ui| {
                             ui.text_edit_singleline(&mut self.horizons_cmd);
-                            if ui.button("Query Horizons").clicked() {
-                                match fetch_jpl_horizons_ephemeris_note(&self.horizons_cmd) {
-                                    Ok(note) => self.api_status_msg = note,
-                                    Err(e) => self.api_status_msg = e,
-                                }
+                            if ui
+                                .add_enabled(!pending, egui::Button::new("Query Horizons"))
+                                .clicked()
+                            {
+                                let cmd = self.horizons_cmd.clone();
+                                self.spawn_public_fetch(
+                                    ctx,
+                                    format!("JPL Horizons ({cmd})"),
+                                    move || {
+                                        PublicDataFetchResult::HorizonsNote(
+                                            fetch_jpl_horizons_ephemeris_note(&cmd),
+                                        )
+                                    },
+                                );
                             }
                         });
 
@@ -1570,6 +2149,65 @@ impl HelioProbeApp {
                     RightTab::SaveLoad => {
                         ui.heading("SQLite WAL & Portable JSON Saves");
                         ui.label(format!("Database: {}", self.db_path.display()));
+                        if let Some(err) = &self.db_error {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(255, 130, 120),
+                                format!("SQLite Error: {err}"),
+                            );
+                        }
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("Open / Switch DB...").clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("SQLite Database", &["db", "sqlite", "sqlite3"])
+                                    .pick_file()
+                                {
+                                    match SaveDatabase::open(&path) {
+                                        Ok(new_db) => {
+                                            self.db_path = path.clone();
+                                            self.db = Some(new_db);
+                                            self.db_error = None;
+                                            self.set_toast(format!(
+                                                "Opened SQLite DB: {}",
+                                                path.display()
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            self.db_error = Some(e.clone());
+                                            self.set_toast(format!("Failed opening DB: {e}"));
+                                        }
+                                    }
+                                }
+                            }
+                            if ui.button("Save DB As...").clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("SQLite Database", &["db", "sqlite", "sqlite3"])
+                                    .set_file_name("helioprobe_saves.db")
+                                    .save_file()
+                                {
+                                    match SaveDatabase::open(&path) {
+                                        Ok(new_db) => match new_db.save_slot(1, &self.state) {
+                                            Ok(()) => {
+                                                self.db_path = path.clone();
+                                                self.db = Some(new_db);
+                                                self.db_error = None;
+                                                self.set_toast(format!(
+                                                    "Saved campaign DB to {}",
+                                                    path.display()
+                                                ));
+                                            }
+                                            Err(e) => {
+                                                self.db_error = Some(e.clone());
+                                                self.set_toast(format!("Failed saving DB: {e}"));
+                                            }
+                                        },
+                                        Err(e) => {
+                                            self.db_error = Some(e.clone());
+                                            self.set_toast(format!("Failed creating DB: {e}"));
+                                        }
+                                    }
+                                }
+                            }
+                        });
                         ui.horizontal(|ui| {
                             ui.label("Campaign:");
                             ui.text_edit_singleline(&mut self.state.campaign_name);
@@ -1586,6 +2224,12 @@ impl HelioProbeApp {
                                             }
                                             Err(e) => self.set_toast(e),
                                         }
+                                    } else {
+                                        let msg = self
+                                            .db_error
+                                            .clone()
+                                            .unwrap_or_else(|| "SQLite database unavailable.".into());
+                                        self.set_toast(format!("Slot {slot} save failed: {msg}"));
                                     }
                                 }
                                 if ui.button("Load").clicked() {
@@ -1597,46 +2241,89 @@ impl HelioProbeApp {
                                             }
                                             Err(e) => self.set_toast(e),
                                         }
+                                    } else {
+                                        let msg = self
+                                            .db_error
+                                            .clone()
+                                            .unwrap_or_else(|| "SQLite database unavailable.".into());
+                                        self.set_toast(format!("Slot {slot} load failed: {msg}"));
                                     }
                                 }
                             });
                         }
                         if let Some(db) = &self.db {
-                            if let Ok(slots) = db.list_slots() {
-                                ui.separator();
-                                for s in slots {
-                                    ui.label(format!(
-                                        "Slot {}: {} ({} SP) — {}",
-                                        s.slot_id, s.campaign_name, s.science_points, s.updated_utc
-                                    ));
+                            match db.list_slots() {
+                                Ok(slots) => {
+                                    ui.separator();
+                                    for s in slots {
+                                        ui.label(format!(
+                                            "Slot {}: {} ({} SP) — {}",
+                                            s.slot_id, s.campaign_name, s.science_points, s.updated_utc
+                                        ));
+                                    }
+                                }
+                                Err(e) => {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(255, 130, 120),
+                                        format!("Slot list error: {e}"),
+                                    );
                                 }
                             }
                         }
                         ui.separator();
                         ui.strong("Portable JSON Campaign Export / Import");
-                        ui.text_edit_singleline(&mut self.json_export_path);
+                        ui.label(format!("Active JSON Path: {}", self.json_export_path));
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("Export JSON...").clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("JSON Campaign", &["json"])
+                                    .set_file_name("helioprobe_campaign_save.json")
+                                    .save_file()
+                                {
+                                    self.json_export_path = path.display().to_string();
+                                    match export_campaign_json(&self.state, &path) {
+                                        Ok(()) => self.set_toast(format!(
+                                            "Exported campaign JSON to {}",
+                                            path.display()
+                                        )),
+                                        Err(e) => self.set_toast(format!("Export failed: {e}")),
+                                    }
+                                }
+                            }
+                            if ui.button("Import JSON...").clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("JSON Campaign", &["json"])
+                                    .pick_file()
+                                {
+                                    self.json_export_path = path.display().to_string();
+                                    match import_campaign_json(&path) {
+                                        Ok(loaded) => {
+                                            self.state = loaded;
+                                            self.set_toast(format!(
+                                                "Imported campaign JSON from {}",
+                                                path.display()
+                                            ));
+                                        }
+                                        Err(e) => self.set_toast(format!("Import failed: {e}")),
+                                    }
+                                }
+                            }
+                        });
                         ui.horizontal(|ui| {
-                            if ui.button("Export JSON").clicked() {
-                                match serde_json::to_string_pretty(&self.state)
-                                    .map_err(|e| e.to_string())
-                                    .and_then(|txt| {
-                                        std::fs::write(&self.json_export_path, txt)
-                                            .map_err(|e| e.to_string())
-                                    }) {
+                            ui.text_edit_singleline(&mut self.json_export_path);
+                            if ui.small_button("Write").clicked() {
+                                let path = PathBuf::from(&self.json_export_path);
+                                match export_campaign_json(&self.state, &path) {
                                     Ok(()) => self.set_toast(format!(
                                         "Exported campaign JSON to {}",
-                                        self.json_export_path
+                                        path.display()
                                     )),
                                     Err(e) => self.set_toast(format!("Export failed: {e}")),
                                 }
                             }
-                            if ui.button("Import JSON").clicked() {
-                                match std::fs::read_to_string(&self.json_export_path)
-                                    .map_err(|e| e.to_string())
-                                    .and_then(|txt| {
-                                        serde_json::from_str::<CampaignState>(&txt)
-                                            .map_err(|e| e.to_string())
-                                    }) {
+                            if ui.small_button("Read").clicked() {
+                                let path = PathBuf::from(&self.json_export_path);
+                                match import_campaign_json(&path) {
                                     Ok(loaded) => {
                                         self.state = loaded;
                                         self.set_toast("Imported campaign JSON successfully.");
@@ -1648,6 +2335,108 @@ impl HelioProbeApp {
                     }
                 }
             });
+
+        // Bottom Copyright, About & Flight Director Mission Log Bar/Drawer (must precede CentralPanel)
+        egui::TopBottomPanel::bottom("bottom_copyright_bar").show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.small("Copyright CRV Science Network  •  GPL-3.0-or-later  •  HelioProbe v2.3.0");
+                ui.separator();
+                if ui.small_button("About HelioProbe").clicked() {
+                    self.show_about_window = true;
+                }
+                ui.hyperlink_to("crvscience.com", "https://crvscience.com");
+                ui.separator();
+                let log_count = self.state.mission_log.len();
+                let log_btn_lbl = if self.mission_log_open {
+                    format!("Hide Flight Director Log ({log_count})")
+                } else {
+                    format!("Flight Director Log ({log_count})")
+                };
+                if ui.small_button(log_btn_lbl).clicked() {
+                    self.mission_log_open = !self.mission_log_open;
+                }
+                if let Some(latest) = self.state.mission_log.last() {
+                    ui.weak(format!("Latest: {latest}"));
+                }
+            });
+        });
+
+        if self.mission_log_open {
+            egui::TopBottomPanel::bottom("flight_director_log_drawer")
+                .resizable(true)
+                .default_height(145.0)
+                .min_height(90.0)
+                .max_height(260.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong(format!(
+                            "Flight Director Telemetry & Event Log ({} entries)",
+                            self.state.mission_log.len()
+                        ));
+                        if ui.small_button("Close").clicked() {
+                            self.mission_log_open = false;
+                        }
+                    });
+                    ui.separator();
+                    ui.push_id("mission_log_scroll", |ui| {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            if self.state.mission_log.is_empty() {
+                                ui.weak("No Flight Director telemetry logged yet.");
+                            }
+                            for entry in self.state.mission_log.iter().rev() {
+                                let color = if entry.contains("[SLINGSHOT]") {
+                                    egui::Color32::from_rgb(255, 205, 95)
+                                } else if entry.contains("[SURFACE OPS]") {
+                                    egui::Color32::from_rgb(95, 235, 255)
+                                } else if entry.contains("[SUN-EARTH L2]") {
+                                    egui::Color32::from_rgb(165, 195, 255)
+                                } else if entry.contains("[LOSS OF SIGNAL]") {
+                                    egui::Color32::from_rgb(255, 135, 120)
+                                } else if entry.contains("ACHIEVEMENT") {
+                                    egui::Color32::from_rgb(110, 245, 175)
+                                } else {
+                                    egui::Color32::from_rgb(205, 220, 240)
+                                };
+                                ui.colored_label(color, entry);
+                            }
+                        });
+                    });
+                });
+        }
+
+        if self.show_about_window {
+            let mut open = self.show_about_window;
+            egui::Window::new("About HelioProbe")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.heading("HelioProbe v2.3.0");
+                    ui.label("Copyright CRV Science Network");
+                    ui.label("License: GNU General Public License v3.0 or later (GPL-3.0-or-later)");
+                    ui.separator();
+                    ui.label("Native Rust 3D Space Probe, Sun-Earth L2 Space Telescopes,");
+                    ui.label("3D Universal-Variable Lambert Porkchop & Gravity-Assist Lab,");
+                    ui.label("Dynamic Comets, and Ocean-World Cryobot Simulator.");
+                    ui.add_space(6.0);
+                    ui.hyperlink_to(
+                        "CRV Science Network Website (https://crvscience.com)",
+                        "https://crvscience.com",
+                    );
+                    ui.hyperlink_to(
+                        "CRV Science Public Apps (https://crvscience.com/apps)",
+                        "https://crvscience.com/apps",
+                    );
+                    ui.add_space(6.0);
+                    if ui.button("Close").clicked() {
+                        self.show_about_window = false;
+                    }
+                });
+            if !open {
+                self.show_about_window = false;
+            }
+        }
 
         // Central 3D wgpu Viewport
         egui::CentralPanel::default()
@@ -1663,8 +2452,14 @@ impl HelioProbeApp {
                 if response.dragged() {
                     let delta = response.drag_delta();
                     self.camera.yaw_rad -= (delta.x as f64) * 0.0065;
+                    let is_cryobot_active = self
+                        .state
+                        .surface_deployments
+                        .get(&self.selected_body_id)
+                        .and_then(|units| units.last())
+                        .is_some_and(|u| u.kind == SurfaceUnitKind::OceanCryobot);
                     let min_pitch = if self.camera_mode == CameraTrackMode::LanderBotView {
-                        0.05
+                        if is_cryobot_active { -0.45 } else { 0.05 }
                     } else {
                         -1.45
                     };
@@ -1736,18 +2531,20 @@ impl HelioProbeApp {
 
                 if self.show_labels {
                     let painter = ui.painter_at(rect);
-                    for lbl in &frame_build.labels {
+                    let placed_labels =
+                        deoverlap_screen_labels(&frame_build.labels, &self.selected_body_id, rect);
+                    for (lbl, text_pos) in placed_labels {
                         let is_sel =
                             lbl.body_id == self.selected_body_id && !lbl.text.starts_with("Probe ");
                         if is_sel {
                             painter.circle_stroke(
                                 lbl.screen_pos,
                                 lbl.radius_px + 5.0,
-                                egui::Stroke::new(1.6, egui::Color32::from_rgb(95, 240, 200)),
+                                egui::Stroke::new(1.6_f32, egui::Color32::from_rgb(95, 240, 200)),
                             );
                         }
                         painter.text(
-                            egui::pos2(lbl.screen_pos.x, lbl.screen_pos.y - lbl.radius_px - 6.0),
+                            text_pos,
                             egui::Align2::CENTER_BOTTOM,
                             &lbl.text,
                             egui::FontId::proportional(if is_sel { 13.0 } else { 11.0 }),
@@ -1776,7 +2573,7 @@ impl HelioProbeApp {
                     p.rect_stroke(
                         hud_rect,
                         6.0,
-                        egui::Stroke::new(1.2, egui::Color32::from_rgb(56, 189, 248)),
+                        egui::Stroke::new(1.2_f32, egui::Color32::from_rgb(56, 189, 248)),
                         egui::StrokeKind::Inside,
                     );
                     let active_ap = self
@@ -1987,7 +2784,7 @@ pub fn render_headless_screenshot(
         for obs_id in ["jwst_l2", "roman_l2", "interceptor_l2"] {
             let _ = app.state.deploy_l2_observatory(obs_id);
         }
-        if let Some(halley) = catalog.iter().find(|b| b.id == "1p_halley") {
+        if let Some(halley) = catalog.iter().find(|b| b.id == "halley_1p") {
             let _ = app.state.warp_comet_to_perihelion(halley);
         }
         app.selected_body_id = "sun_earth_l2".into();

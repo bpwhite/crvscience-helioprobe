@@ -19,6 +19,7 @@ pub mod astrodynamics_lab;
 pub mod catalog;
 pub mod gamification;
 pub mod gui;
+pub mod icon;
 pub mod l2_comets;
 pub mod physics;
 pub mod probes;

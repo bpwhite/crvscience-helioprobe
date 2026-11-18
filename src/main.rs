@@ -13,7 +13,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://gnu.org>.
 
-#![forbid(unsafe_code)]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![deny(unsafe_code)]
 
 use clap::{Parser, Subcommand};
 use eframe::egui;
@@ -23,6 +24,7 @@ use helioprobe::astrodynamics_lab::{
 use helioprobe::catalog::bootstrap_catalog;
 use helioprobe::gamification::SaveDatabase;
 use helioprobe::gui::HelioProbeApp;
+use helioprobe::icon::helioprobe_window_icon;
 use helioprobe::public_data::{
     fetch_jpl_sbdb_small_body, fetch_nasa_exoplanet, fetch_simbad_deep_sky,
 };
@@ -68,7 +70,20 @@ enum Commands {
     Slots,
 }
 
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn attach_parent_console_if_cli_args() {
+    if std::env::args_os().len() > 1 {
+        unsafe {
+            let _ = windows_sys::Win32::System::Console::AttachConsole(u32::MAX);
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(windows)]
+    attach_parent_console_if_cli_args();
+
     let cli = Cli::parse();
 
     if let Some(cmd) = cli.command {
@@ -142,7 +157,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         viewport: egui::ViewportBuilder::default()
             .with_title("HelioProbe v2.3.0 — 3D Space Probe, Sun-Earth L2 Telescopes, Dynamic Comets & Public Astronomy Simulator")
             .with_inner_size([1520.0, 920.0])
-            .with_min_inner_size([1024.0, 680.0]),
+            .with_min_inner_size([1024.0, 680.0])
+            .with_icon(std::sync::Arc::new(helioprobe_window_icon())),
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };

@@ -412,26 +412,38 @@ impl CampaignState {
         self.evaluate_achievements()
     }
 
+    pub fn can_scan_all_bands(&self, target: &CelestialBody) -> bool {
+        target.id == "earth"
+            || self.has_orbiting_probe_at(&target.id)
+            || (target.id == "sun_earth_l2" && !self.deployed_l2_observatories.is_empty())
+    }
+
+    pub fn can_scan_band(&self, target: &CelestialBody, band: ScanBand) -> bool {
+        if self.can_scan_all_bands(target) {
+            return true;
+        }
+        let jwst_remote = self.deployed_l2_observatories.contains("jwst_l2")
+            && matches!(band, ScanBand::OpticalNir | ScanBand::ThermalMassSpec)
+            && matches!(
+                target.category,
+                BodyCategory::Comet
+                    | BodyCategory::Exoplanet
+                    | BodyCategory::Nebula
+                    | BodyCategory::DwarfPlanet
+            );
+        let roman_remote =
+            self.deployed_l2_observatories.contains("roman_l2") && band == ScanBand::OpticalNir;
+        let coronagraph_remote =
+            band == ScanBand::OpticalNir && self.unlocked_techs.contains("coronagraph_jwst");
+        coronagraph_remote || jwst_remote || roman_remote
+    }
+
     pub fn perform_scan(
         &mut self,
         target: &CelestialBody,
         band: ScanBand,
     ) -> Result<(bool, Vec<&'static AchievementDef>), String> {
-        let jwst_remote = self.deployed_l2_observatories.contains("jwst_l2")
-            && matches!(band, ScanBand::OpticalNir | ScanBand::ThermalMassSpec)
-            && matches!(
-                target.category,
-                BodyCategory::Comet | BodyCategory::Exoplanet | BodyCategory::Nebula | BodyCategory::DwarfPlanet
-            );
-        let roman_remote = self.deployed_l2_observatories.contains("roman_l2")
-            && band == ScanBand::OpticalNir;
-        let l2_self_scan = target.id == "sun_earth_l2" && !self.deployed_l2_observatories.is_empty();
-        let remote_allowed = (band == ScanBand::OpticalNir
-            && self.unlocked_techs.contains("coronagraph_jwst"))
-            || jwst_remote
-            || roman_remote
-            || l2_self_scan;
-        if target.id != "earth" && !remote_allowed && !self.has_orbiting_probe_at(&target.id) {
+        if !self.can_scan_band(target, band) {
             return Err(format!(
                 "Launch a probe from Earth and establish orbit around {} before running orbital {} scans.",
                 target.name,
@@ -641,8 +653,13 @@ impl CampaignState {
         }
         let cid = self.next_capsule_id.max(1);
         self.next_capsule_id = cid + 1;
-        let cap =
-            SampleReturnCapsule::launch_to_earth(cid, target, catalog, self.days_since_j2000);
+        let cap = SampleReturnCapsule::launch_to_earth_with_offsets(
+            cid,
+            target,
+            catalog,
+            self.days_since_j2000,
+            &self.comet_perihelion_offsets,
+        );
         self.science_points += 40;
         self.push_log(format!(
             "[SAMPLE RETURN] Capsule SRC-{cid} departed {} with {:.1} g sample toward Earth (+40 SP).",
@@ -728,7 +745,9 @@ impl CampaignState {
         }
         let cur_m_deg = comet.mean_anomaly_j2000_deg
             + 360.0 * (self.days_since_j2000 / comet.orbital_period_days);
-        let desired_m_deg = 6.5;
+        let e = comet.eccentricity.clamp(0.0, 0.9995);
+        let e_target_rad = (0.28 / (1.0 + comet.semi_major_axis_au * 0.08)).clamp(0.035, 0.25);
+        let desired_m_deg = (e_target_rad - e * e_target_rad.sin()).to_degrees();
         let offset = (desired_m_deg - cur_m_deg).rem_euclid(360.0);
         self.comet_perihelion_offsets.insert(comet.id.clone(), offset);
         let q_au = comet.semi_major_axis_au * (1.0 - comet.eccentricity);

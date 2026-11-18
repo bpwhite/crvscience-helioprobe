@@ -21,8 +21,12 @@
 //! - Earth Sample-Return Capsules (`SRC`) launching back from target orbit to Earth splashdown & cleanroom curation.
 
 use crate::catalog::{BodyCategory, CelestialBody};
-use crate::physics::{body_scene_position, probe_orbit_radius_scene, visual_body_radius_scene, Vec3d};
+use crate::physics::{
+    body_scene_position, body_scene_position_with_offsets, probe_orbit_radius_scene,
+    visual_body_radius_scene, Vec3d,
+};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SurfaceUnitKind {
@@ -364,10 +368,19 @@ impl AtmosphericProbeRun {
     }
 
     pub fn scene_position(&self, catalog: &[CelestialBody], days_since_j2000: f64) -> Vec3d {
+        self.scene_position_with_offsets(catalog, days_since_j2000, &BTreeMap::new())
+    }
+
+    pub fn scene_position_with_offsets(
+        &self,
+        catalog: &[CelestialBody],
+        days_since_j2000: f64,
+        comet_offsets: &BTreeMap<String, f64>,
+    ) -> Vec3d {
         let Some(body) = catalog.iter().find(|b| b.id == self.body_id) else {
             return Vec3d::default();
         };
-        let center = body_scene_position(body, catalog, days_since_j2000);
+        let center = body_scene_position_with_offsets(body, catalog, days_since_j2000, comet_offsets);
         let r_surf = visual_body_radius_scene(body);
         let r_orb = probe_orbit_radius_scene(body);
         let p = self.progress.clamp(0.0, 1.0);
@@ -406,7 +419,17 @@ impl SampleReturnCapsule {
         catalog: &[CelestialBody],
         days_since_j2000: f64,
     ) -> Self {
-        let p = body_scene_position(origin, catalog, days_since_j2000);
+        Self::launch_to_earth_with_offsets(id, origin, catalog, days_since_j2000, &BTreeMap::new())
+    }
+
+    pub fn launch_to_earth_with_offsets(
+        id: u64,
+        origin: &CelestialBody,
+        catalog: &[CelestialBody],
+        days_since_j2000: f64,
+        comet_offsets: &BTreeMap<String, f64>,
+    ) -> Self {
+        let p = body_scene_position_with_offsets(origin, catalog, days_since_j2000, comet_offsets);
         Self {
             id,
             origin_body_id: origin.id.clone(),
