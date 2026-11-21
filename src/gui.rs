@@ -13,16 +13,16 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://gnu.org>.
 
-//! `eframe` / `egui` 3D Mission Control GUI for HelioProbe v2.1:
+//! `eframe` / `egui` 3D Mission Control GUI for HelioProbe v2.3.0:
 //! - Left Dock: Celestial Catalog filter, Probe Launch Pad with Gravity-Assist Slingshot selector, 6 Camera Modes including `Lander / Bot POV`
 //! - Center 3D Viewport: `wgpu` WGSL 3D space/nebula renderer + live Lander / Cryobot / Entry-Probe POV Telemetry HUD
-//! - Right Dock: 7-tab Science & Engineering Console (`Scanner`, `Windows`, `Landers`, `Tech Lab`, `Awards`, `Public Data`, `Saves`)
+//! - Right Dock: 8-tab Science & Engineering Console (`Scanner`, `L2 & Comets`, `Windows`, `Landers`, `Tech Lab`, `Awards`, `Public Data`, `Saves`)
 
 use crate::astrodynamics_lab::{
     compute_gravity_assist, compute_porkchop_grid_with_offsets, ASSIST_CANDIDATE_IDS,
 };
 use crate::catalog::{bootstrap_catalog, BodyCategory, CelestialBody, ScanBand};
-use crate::gamification::{CampaignState, SaveDatabase, ACHIEVEMENTS};
+use crate::gamification::{AchievementDef, CampaignState, SaveDatabase, ACHIEVEMENTS};
 use crate::l2_comets::{compute_comet_tail_state, L2_OBSERVATORIES};
 use crate::physics::{
     body_scene_position_with_offsets, compute_transfer_from_earth, probe_orbit_radius_scene,
@@ -416,6 +416,36 @@ impl HelioProbeApp {
         self.toast_banner = Some((msg.into(), Instant::now()));
     }
 
+    fn set_toast_with_achievements(
+        &mut self,
+        base: impl Into<String>,
+        unlocked: &[&'static AchievementDef],
+    ) {
+        let mut msg = base.into();
+        if let Some(first) = unlocked.first() {
+            msg.push_str(&format!(
+                " • Achievement: {} (+{} SP)",
+                first.title, first.bonus_points
+            ));
+        }
+        self.set_toast(msg);
+    }
+
+    pub fn quick_save_slot1(&mut self) {
+        if let Some(db) = &self.db {
+            match db.save_slot(1, &self.state) {
+                Ok(()) => self.set_toast("Saved campaign to SQLite Slot 1."),
+                Err(e) => self.set_toast(e),
+            }
+        } else {
+            let msg = self
+                .db_error
+                .clone()
+                .unwrap_or_else(|| "SQLite database unavailable.".to_string());
+            self.set_toast(format!("Quick Save failed: {msg}"));
+        }
+    }
+
     pub fn poll_pending_fetch(&mut self) -> bool {
         let Some(rx) = self.pending_fetch_rx.as_ref() else {
             return false;
@@ -573,6 +603,24 @@ impl eframe::App for HelioProbeApp {
 impl HelioProbeApp {
     pub fn ui_step(&mut self, ctx: &egui::Context) {
         self.poll_pending_fetch();
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if self.show_about_window {
+                self.show_about_window = false;
+            } else if self.mission_log_open {
+                self.mission_log_open = false;
+            }
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::F1)) {
+            self.show_about_window = !self.show_about_window;
+        }
+        if !ctx.wants_keyboard_input() {
+            if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+                self.paused = !self.paused;
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::F5)) {
+                self.quick_save_slot1();
+            }
+        }
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f64().clamp(0.0, 0.1);
         self.last_frame = now;
@@ -596,10 +644,11 @@ impl HelioProbeApp {
             }
 
             for (cs, aname) in flyby_events {
-                let _ = self.state.record_slingshot_flyby(&cs, &aname);
-                self.set_toast(format!(
-                    "{cs} executed hyperbolic Oberth slingshot past {aname}!"
-                ));
+                let unlocked = self.state.record_slingshot_flyby(&cs, &aname);
+                self.set_toast_with_achievements(
+                    format!("{cs} executed hyperbolic Oberth slingshot past {aname}!"),
+                    &unlocked,
+                );
             }
 
             for (pid, tid) in newly_arrived {
@@ -639,12 +688,15 @@ impl HelioProbeApp {
                 }
             }
             for fin in terminated_atmo {
-                let _ = self.state.record_atmo_probe_termination(&fin);
+                let unlocked = self.state.record_atmo_probe_termination(&fin);
                 self.active_scan_pulse = Some((fin.body_id.clone(), Instant::now()));
-                self.set_toast(format!(
-                    "AEP-{} Loss of Signal @ {}: {} (+200 SP)!",
-                    fin.id, fin.body_name, fin.terminal_headline
-                ));
+                self.set_toast_with_achievements(
+                    format!(
+                        "AEP-{} Loss of Signal @ {}: {} (+200 SP)!",
+                        fin.id, fin.body_name, fin.terminal_headline
+                    ),
+                    &unlocked,
+                );
             }
 
             // Step returning Earth Sample-Return Capsules
@@ -655,12 +707,15 @@ impl HelioProbeApp {
                 }
             }
             for (origin_name, grams) in recovered_events {
-                let _ = self.state.record_capsule_recovery(&origin_name, grams);
+                let unlocked = self.state.record_capsule_recovery(&origin_name, grams);
                 self.active_scan_pulse = Some(("earth".into(), Instant::now()));
-                self.set_toast(format!(
-                    "Recovered {:.1} g sample from {} at Earth Curatory!",
-                    grams, origin_name
-                ));
+                self.set_toast_with_achievements(
+                    format!(
+                        "Recovered {:.1} g sample from {} at Earth Curatory!",
+                        grams, origin_name
+                    ),
+                    &unlocked,
+                );
             }
 
             // Step powered orbital-to-surface Lander / Cryobot descent (~4 s)
@@ -841,18 +896,7 @@ impl HelioProbeApp {
                 ui.checkbox(&mut self.show_orbits, "3D Orbits");
                 ui.checkbox(&mut self.show_labels, "Labels");
                 if ui.button("Quick Save (Slot 1)").clicked() {
-                    if let Some(db) = &self.db {
-                        match db.save_slot(1, &self.state) {
-                            Ok(()) => self.set_toast("Saved campaign to SQLite Slot 1."),
-                            Err(e) => self.set_toast(e),
-                        }
-                    } else {
-                        let msg = self
-                            .db_error
-                            .clone()
-                            .unwrap_or_else(|| "SQLite database unavailable.".to_string());
-                        self.set_toast(format!("Quick Save failed: {msg}"));
-                    }
+                    self.quick_save_slot1();
                 }
             });
         });
@@ -866,6 +910,7 @@ impl HelioProbeApp {
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.catalog_search)
+                            .id(egui::Id::new("catalog_search_input"))
                             .desired_width(145.0)
                             .hint_text("Search targets..."),
                     );
@@ -1170,7 +1215,7 @@ impl HelioProbeApp {
                 });
             });
 
-        // Right Dock: 7-Tab Science & Engineering Console
+        // Right Dock: 8-Tab Science & Engineering Console
         egui::SidePanel::right("right_science_dock")
             .default_width(420.0)
             .resizable(true)
@@ -1259,18 +1304,26 @@ impl HelioProbeApp {
                                     remote_msg,
                                 );
                             } else if ui
-                                .button("Run Full 5-Band Instrument Sweep (+All Remaining SP)")
+                                .add_enabled(
+                                    self.state.scanned_count_for(&target.id) < ScanBand::ALL.len(),
+                                    egui::Button::new(
+                                        "Run Full 5-Band Instrument Sweep (+All Remaining SP)",
+                                    ),
+                                )
                                 .clicked()
                             {
+                                let mut unlocked_all = Vec::new();
                                 for band in ScanBand::ALL {
-                                    let _ = self.state.perform_scan(&target, band);
+                                    if let Ok((_, achs)) = self.state.perform_scan(&target, band) {
+                                        unlocked_all.extend(achs);
+                                    }
                                 }
                                 self.active_scan_pulse =
                                     Some((target.id.clone(), Instant::now()));
-                                self.set_toast(format!(
-                                    "Completed 5-band scientific survey of {}!",
-                                    target.name
-                                ));
+                                self.set_toast_with_achievements(
+                                    format!("Completed 5-band scientific survey of {}!", target.name),
+                                    &unlocked_all,
+                                );
                             }
 
                             ui.push_id("scanner_bands_scroll", |ui| {
@@ -1428,12 +1481,18 @@ impl HelioProbeApp {
                                             );
                                             self.state.l2_intercepts_launched += 1;
                                             self.state.science_points += 90;
-                                            let _ = self.state.record_launch(p);
+                                            let unlocked = self.state.record_launch(p);
                                             self.tracked_probe_id = Some(pid);
                                             self.selected_body_id = comet.id.clone();
                                             self.camera_mode = CameraTrackMode::RideLatestProbe;
                                             self.desired_cam_distance = 0.32;
-                                            self.set_toast(format!("{cs} departed Sun-Earth L2 toward {} (+90 SP)!", comet.name));
+                                            self.set_toast_with_achievements(
+                                                format!(
+                                                    "{cs} departed Sun-Earth L2 toward {} (+90 SP)!",
+                                                    comet.name
+                                                ),
+                                                &unlocked,
+                                            );
                                         }
                                     });
                                 });
@@ -2053,10 +2112,12 @@ impl HelioProbeApp {
                             "https://ssd-api.jpl.nasa.gov/doc/sbdb.html",
                         );
                         ui.horizontal(|ui| {
-                            ui.text_edit_singleline(&mut self.sbdb_query);
+                            let resp = ui.text_edit_singleline(&mut self.sbdb_query);
+                            let enter = enter_submitted(ui, &resp);
                             if ui
                                 .add_enabled(!pending, egui::Button::new("Import Asteroid/Comet"))
                                 .clicked()
+                                || (!pending && enter)
                             {
                                 let q = self.sbdb_query.clone();
                                 self.spawn_public_fetch(ctx, format!("JPL SBDB ({q})"), move || {
@@ -2075,10 +2136,12 @@ impl HelioProbeApp {
                             "https://caltech-ipac.github.io/nexsciTAP/intro.html",
                         );
                         ui.horizontal(|ui| {
-                            ui.text_edit_singleline(&mut self.exoplanet_query);
+                            let resp = ui.text_edit_singleline(&mut self.exoplanet_query);
+                            let enter = enter_submitted(ui, &resp);
                             if ui
                                 .add_enabled(!pending, egui::Button::new("Import Exoplanet"))
                                 .clicked()
+                                || (!pending && enter)
                             {
                                 let q = self.exoplanet_query.clone();
                                 self.spawn_public_fetch(
@@ -2099,10 +2162,12 @@ impl HelioProbeApp {
                             "https://simbad.cds.unistra.fr/simbad/sim-tap",
                         );
                         ui.horizontal(|ui| {
-                            ui.text_edit_singleline(&mut self.simbad_query);
+                            let resp = ui.text_edit_singleline(&mut self.simbad_query);
+                            let enter = enter_submitted(ui, &resp);
                             if ui
                                 .add_enabled(!pending, egui::Button::new("Import Nebula/Object"))
                                 .clicked()
+                                || (!pending && enter)
                             {
                                 let q = self.simbad_query.clone();
                                 self.spawn_public_fetch(ctx, format!("CDS SIMBAD ({q})"), move || {
@@ -2121,10 +2186,12 @@ impl HelioProbeApp {
                             "https://ssd-api.jpl.nasa.gov/doc/horizons.html",
                         );
                         ui.horizontal(|ui| {
-                            ui.text_edit_singleline(&mut self.horizons_cmd);
+                            let resp = ui.text_edit_singleline(&mut self.horizons_cmd);
+                            let enter = enter_submitted(ui, &resp);
                             if ui
                                 .add_enabled(!pending, egui::Button::new("Query Horizons"))
                                 .clicked()
+                                || (!pending && enter)
                             {
                                 let cmd = self.horizons_cmd.clone();
                                 self.spawn_public_fetch(
@@ -2663,6 +2730,10 @@ impl HelioProbeApp {
     }
 }
 
+fn enter_submitted(ui: &egui::Ui, resp: &egui::Response) -> bool {
+    resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+}
+
 fn block_on_future<F: std::future::Future>(fut: F) -> F::Output {
     struct NoopWake;
     impl std::task::Wake for NoopWake {
@@ -2934,4 +3005,207 @@ pub fn render_headless_screenshot(
     drop(mapped);
     staging.unmap();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run_key_frame(ctx: &egui::Context, app: &mut HelioProbeApp, key: Option<egui::Key>) {
+        let mut raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        if let Some(k) = key {
+            raw.events.push(egui::Event::Key {
+                key: k,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        let _ = ctx.run(raw, |ctx| {
+            app.ui_step(ctx);
+        });
+    }
+
+    #[test]
+    fn headless_shortcuts_space_f1_escape_respect_text_focus() {
+        let ctx = egui::Context::default();
+        let mut app = HelioProbeApp::new_headless(PathBuf::from("test_shortcuts.db"));
+        assert!(!app.paused);
+
+        // Warmup frame without focus
+        run_key_frame(&ctx, &mut app, None);
+        // Space toggles paused when no text input is focused
+        run_key_frame(&ctx, &mut app, Some(egui::Key::Space));
+        assert!(app.paused, "Space should pause simulation when unfocused");
+        run_key_frame(&ctx, &mut app, Some(egui::Key::Space));
+        assert!(!app.paused, "Space should resume simulation when unfocused");
+
+        // Focus search TextEdit -> Space must NOT toggle paused
+        ctx.memory_mut(|m| m.request_focus(egui::Id::new("catalog_search_input")));
+        run_key_frame(&ctx, &mut app, None);
+        assert!(ctx.wants_keyboard_input());
+        run_key_frame(&ctx, &mut app, Some(egui::Key::Space));
+        assert!(
+            !app.paused,
+            "Space must not pause while a text field has keyboard focus"
+        );
+
+        // Clear focus, test F1 & Escape cascade (show_about_window -> mission_log_open)
+        ctx.memory_mut(|m| m.surrender_focus(egui::Id::new("catalog_search_input")));
+        run_key_frame(&ctx, &mut app, None);
+        app.mission_log_open = true;
+        run_key_frame(&ctx, &mut app, Some(egui::Key::F1));
+        assert!(app.show_about_window, "F1 should open About window");
+
+        run_key_frame(&ctx, &mut app, Some(egui::Key::Escape));
+        assert!(!app.show_about_window, "First Escape closes About window");
+        assert!(
+            app.mission_log_open,
+            "First Escape should leave mission log open when About was open"
+        );
+
+        run_key_frame(&ctx, &mut app, Some(egui::Key::Escape));
+        assert!(
+            !app.mission_log_open,
+            "Second Escape closes Flight Director log"
+        );
+
+        // F1 toggles About open and closed again
+        run_key_frame(&ctx, &mut app, Some(egui::Key::F1));
+        assert!(app.show_about_window);
+        run_key_frame(&ctx, &mut app, Some(egui::Key::F1));
+        assert!(!app.show_about_window);
+    }
+
+    #[test]
+    fn achievement_toasts_surface_for_slingshot_atmo_recovery_and_sweep() {
+        let ctx = egui::Context::default();
+        let mut app = HelioProbeApp::new_headless(PathBuf::from("test_ach_toast.db"));
+        let catalog = app.full_catalog();
+        let jupiter = catalog
+            .iter()
+            .find(|b| b.id == "jupiter")
+            .expect("jupiter")
+            .clone();
+        let saturn = catalog
+            .iter()
+            .find(|b| b.id == "saturn")
+            .expect("saturn")
+            .clone();
+        let bennu = catalog
+            .iter()
+            .find(|b| b.id == "bennu")
+            .expect("bennu")
+            .clone();
+
+        // 1. Slingshot flyby during ui_step unlocks "Slingshot Navigator"
+        let mut probe = SpaceProbe::launch_with_options(
+            1,
+            "CRV-Slingshot-1".into(),
+            PropulsionBus::RtgNuclearElectric,
+            &saturn,
+            Some(&jupiter),
+            &app.state.unlocked_techs,
+            &catalog,
+            app.state.days_since_j2000,
+        );
+        probe.transit_progress = 0.479;
+        let _ = app.state.record_launch(probe);
+        app.last_frame = Instant::now() - std::time::Duration::from_millis(80);
+        run_key_frame(&ctx, &mut app, None);
+        let msg = app
+            .toast_banner
+            .as_ref()
+            .map(|(m, _)| m.clone())
+            .unwrap_or_default();
+        assert!(
+            msg.contains("• Achievement: Oberth Gravity Slingshot (+300 SP)"),
+            "Expected slingshot achievement toast, got: {msg}"
+        );
+
+        // 2. Atmospheric probe termination during ui_step unlocks "Galileo Crush-Depth Plunge"
+        app.state.orbited_bodies.insert(jupiter.id.clone());
+        let mut orb_jup = SpaceProbe::launch_from_earth(
+            2,
+            "CRV-Jup".into(),
+            PropulsionBus::RtgNuclearElectric,
+            &jupiter,
+            &catalog,
+            app.state.days_since_j2000,
+        );
+        orb_jup.phase = ProbePhase::Orbiting;
+        app.state.probes.push(orb_jup);
+        let mut aep = app
+            .state
+            .launch_atmospheric_probe(&jupiter)
+            .expect("atmo probe");
+        aep.progress = 0.999;
+        app.state.atmospheric_probes[0] = aep;
+        app.last_frame = Instant::now() - std::time::Duration::from_millis(80);
+        run_key_frame(&ctx, &mut app, None);
+        let msg = app
+            .toast_banner
+            .as_ref()
+            .map(|(m, _)| m.clone())
+            .unwrap_or_default();
+        assert!(
+            msg.contains("• Achievement: Galileo Crush-Depth Plunge (+350 SP)"),
+            "Expected atmo termination achievement toast, got: {msg}"
+        );
+
+        // 3. Capsule recovery during ui_step unlocks "Cleanroom Sample Curatory"
+        let mut cap = app
+            .state
+            .launch_sample_return(&jupiter, &catalog)
+            .expect("sample return");
+        cap.progress = 0.999;
+        app.state.sample_capsules[0] = cap;
+        app.last_frame = Instant::now() - std::time::Duration::from_millis(80);
+        run_key_frame(&ctx, &mut app, None);
+        let msg = app
+            .toast_banner
+            .as_ref()
+            .map(|(m, _)| m.clone())
+            .unwrap_or_default();
+        assert!(
+            msg.contains("• Achievement: Cleanroom Sample Curatory (+450 SP)"),
+            "Expected sample return achievement toast, got: {msg}"
+        );
+
+        // 4. 5-band sweep surfaces achievement via set_toast_with_achievements
+        app.state.orbited_bodies.insert(bennu.id.clone());
+        let mut orb_bennu = SpaceProbe::launch_from_earth(
+            3,
+            "CRV-Bennu".into(),
+            PropulsionBus::ChemicalCentaur,
+            &bennu,
+            &catalog,
+            app.state.days_since_j2000,
+        );
+        orb_bennu.phase = ProbePhase::Orbiting;
+        app.state.probes.push(orb_bennu);
+        let mut unlocked_all = Vec::new();
+        for band in ScanBand::ALL {
+            if let Ok((_, achs)) = app.state.perform_scan(&bennu, band) {
+                unlocked_all.extend(achs);
+            }
+        }
+        app.set_toast_with_achievements("Completed 5-band scientific survey of Bennu!", &unlocked_all);
+        let msg = app
+            .toast_banner
+            .as_ref()
+            .map(|(m, _)| m.clone())
+            .unwrap_or_default();
+        assert!(
+            msg.contains("• Achievement: OSIRIS Sample Legacy (+200 SP)"),
+            "Expected Bennu 5-band sweep achievement toast, got: {msg}"
+        );
+    }
 }

@@ -4,10 +4,13 @@
 
 Native safe-Rust (`#![forbid(unsafe_code)]`) 3D graphical space probe, orbital mechanics, gravity-assist planner, surface lander & ocean-world cryobot POV, atmospheric entry crash probe, sample-return, and public astronomy simulation game built with `eframe`/`egui` (`0.31`), `wgpu` (`24.0` WGSL custom 3D shader pipeline), `rusqlite` (bundled SQLite WAL persistence), and `ureq` live astronomical harvesters.
 
+- **Website**: [CRV Science Network](https://crvscience.com) · [CRV Science Public Apps](https://crvscience.com/apps)
+- **License**: GNU General Public License v3.0 or later (`GPL-3.0-or-later`, see [LICENSE](LICENSE))
+
 ## Core Architecture (10 Safe-Rust Modules)
 
-- **Scientifically Grounded 41-Target Bootstrap Catalog (`src/catalog.rs`)**:
-  - Pre-loaded with metric bulk and orbital parameters, monotonic physical radius scaling, and 5-band instrument telemetry across **41 real targets** (205 verified fact cards), spanning the [Sun](https://nssdc.gsfc.nasa.gov/planetary/factsheet/sunfact.html), all 8 planets ([NASA Planetary Fact Sheet](https://nssdc.gsfc.nasa.gov/planetary/factsheet/)), all 5 IAU dwarf planets, 10 moons, 4 asteroids, 5 exoplanets, and 8 deep-sky nebulae.
+- **Scientifically Grounded 46-Target Bootstrap Catalog (`src/catalog.rs`)**:
+  - Pre-loaded with metric bulk and orbital parameters, monotonic physical radius scaling, and 5-band instrument telemetry across **46 real targets** (230 verified fact cards), spanning the [Sun](https://nssdc.gsfc.nasa.gov/planetary/factsheet/sunfact.html), all 8 planets ([NASA Planetary Fact Sheet](https://nssdc.gsfc.nasa.gov/planetary/factsheet/)), all 5 IAU dwarf planets, 10 moons, 4 asteroids, 4 eccentric comets, the Sun–Earth L2 Lagrange point, 5 exoplanets, and 8 deep-sky nebulae.
 - **Gravity-Assist Slingshot & Porkchop Launch-Window Planner (`src/astrodynamics_lab.rs`)**:
   - Computes synodic periods, planetary phase-angle offsets, 2D Lambert-approximated Porkchop $\Delta v$ contour heatmaps (`departure_offset_days` $\times$ `flight_days`) with 1-click epoch snapping, and 2-leg patched-conic Gravity-Assist Slingshot trajectories (`Earth -> Venus/Mars/Jupiter/Saturn -> Target`).
 - **Surface Landers, Ocean Cryobots, Galileo Atmospheric Crash Probes & `6. Lander / Bot POV` (`src/surface_ops.rs`, `src/gui.rs`)**:
