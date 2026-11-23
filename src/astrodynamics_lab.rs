@@ -23,8 +23,9 @@
 
 use crate::catalog::{BodyCategory, CelestialBody};
 use crate::physics::{
-    compute_transfer_from_earth, kepler_position_au, kepler_state_ecliptic_km, stumpff_c_s, Vec3d,
-    AU_KM, EARTH_RADIUS_KM, GM_EARTH_KM3_S2, GM_SUN_KM3_S2, LEO_ALTITUDE_KM,
+    compute_capture_orbit, compute_transfer_from_earth, kepler_position_au,
+    kepler_state_ecliptic_km, stumpff_c_s, Vec3d, AU_KM, EARTH_RADIUS_KM, GM_EARTH_KM3_S2,
+    GM_SUN_KM3_S2, LEO_ALTITUDE_KM,
 };
 use std::collections::BTreeMap;
 use std::f64::consts::{PI, TAU};
@@ -277,27 +278,8 @@ pub fn solve_lambert_branch(
     Some((v1, v2))
 }
 
-fn target_capture_dv(target: &CelestialBody, v_inf_arr_km_s: f64) -> f64 {
-    let cap_alt_km = if target.id == "sun" {
-        6_100_000.0
-    } else if target.radius_km < 10.0 {
-        1.5
-    } else if target.radius_km > 20_000.0 {
-        4_500.0
-    } else {
-        300.0
-    };
-    let r_cap_km = (target.radius_km + cap_alt_km).max(1.0);
-    let gm_target = target.gm_km3_s2();
-    // Use e = 0.60 elliptical science capture orbit for outer gas/ice giants (Juno/Cassini class),
-    // and circular science orbit for terrestrial/dwarf/asteroid bodies.
-    let v_cap_orb = if target.radius_km > 20_000.0 {
-        (1.60 * gm_target / r_cap_km).sqrt()
-    } else {
-        (gm_target / r_cap_km).sqrt()
-    };
-    let v_peri_arr = (v_inf_arr_km_s * v_inf_arr_km_s + 2.0 * gm_target / r_cap_km).sqrt();
-    (v_peri_arr - v_cap_orb).abs()
+pub fn target_capture_dv(target: &CelestialBody, v_inf_arr_km_s: f64) -> f64 {
+    compute_capture_orbit(target, v_inf_arr_km_s).capture_dv_km_s
 }
 
 /// Computes a `cols x rows` 3D universal-variable Lambert Porkchop `delta_v` & `C3` contour matrix

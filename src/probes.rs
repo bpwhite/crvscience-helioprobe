@@ -120,6 +120,8 @@ pub struct SpaceProbe {
     pub orbit_inclination_rad: f64,
     pub total_delta_v_km_s: f64,
     pub physical_flight_days: f64,
+    #[serde(default)]
+    pub proper_flight_days: f64,
     pub capture_orbit_vel_km_s: f64,
     pub capture_altitude_km: f64,
     pub lorentz_gamma: f64,
@@ -210,6 +212,12 @@ impl SpaceProbe {
             }
         }
 
+        let proper_days = if assist_id.is_some() {
+            flight_days
+        } else {
+            xfer.proper_flight_days
+        };
+
         Self {
             id,
             callsign,
@@ -229,6 +237,7 @@ impl SpaceProbe {
             orbit_inclination_rad: 0.42 + ((id % 5) as f64) * 0.14,
             total_delta_v_km_s: total_dv,
             physical_flight_days: flight_days,
+            proper_flight_days: proper_days,
             capture_orbit_vel_km_s: xfer.capture_orbit_vel_km_s,
             capture_altitude_km: xfer.capture_altitude_km,
             lorentz_gamma: xfer.lorentz_gamma,

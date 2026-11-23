@@ -22,8 +22,8 @@ use crate::l2_comets::{
     compute_comet_tail_state, sample_dust_tail_point, sun_earth_l2_halo_position, L2_OBSERVATORIES,
 };
 use crate::physics::{
-    body_scene_position_with_offsets, compress_au_to_scene, kepler_position_au,
-    visual_body_radius_scene, Vec3d,
+    body_scene_position_with_offsets, compress_au_to_scene,
+    kepler_position_from_eccentric_anomaly_au, visual_body_radius_scene, Vec3d,
 };
 use crate::probes::{ProbePhase, PropulsionBus, SpaceProbe};
 use crate::surface_ops::{
@@ -89,7 +89,8 @@ impl OrbitCamera3D {
         self.target.add(offset)
     }
 
-    pub fn project(&self, world: Vec3d, aspect: f64) -> Option<(f32, f32, f64)> {
+    /// Returns the orthonormal camera basis `(right, up, forward)` in world coordinates.
+    pub fn view_basis(&self) -> (Vec3d, Vec3d, Vec3d) {
         let eye = self.eye_position();
         let forward = self.target.sub(eye).normalized();
         let world_up = self
@@ -102,6 +103,12 @@ impl OrbitCamera3D {
         }
         let right = right.normalized();
         let up = right.cross(forward).normalized();
+        (right, up, forward)
+    }
+
+    pub fn project(&self, world: Vec3d, aspect: f64) -> Option<(f32, f32, f64)> {
+        let eye = self.eye_position();
+        let (right, up, forward) = self.view_basis();
 
         let rel = world.sub(eye);
         let z_cam = rel.dot(forward);
@@ -118,16 +125,144 @@ impl OrbitCamera3D {
     }
 }
 
+/// Transforms the true world-space body-to-Sun vector into camera view space `(lx, ly, lz)`
+/// matching the billboard sphere normal basis `(right, up, -forward)`.
+pub fn body_sun_light_view_space(camera: &OrbitCamera3D, body_world: Vec3d) -> [f32; 3] {
+    let to_sun = if body_world.length() > 1e-6 {
+        body_world.scale(-1.0).normalized()
+    } else {
+        Vec3d::new(0.0, 0.0, 1.0)
+    };
+    let (right, up, forward) = camera.view_basis();
+    let lx = to_sun.dot(right) as f32;
+    let ly = to_sun.dot(up) as f32;
+    let lz = to_sun.dot(forward.scale(-1.0)) as f32;
+    let len = (lx * lx + ly * ly + lz * lz).sqrt().max(1e-6);
+    [lx / len, ly / len, lz / len]
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PlanetaryRingSpec {
+    pub obliquity_deg: f64,
+    pub pole_az_deg: f64,
+    pub ring_mul: f64,
+    pub r_inner_norm: f64,
+    pub ring_alpha: f32,
+    pub color_rgb: [f32; 3],
+    pub cassini_strength: f32,
+}
+
+/// Returns physical obliquity, ring extent, inner/outer radii, and albedo tint for ringed Solar System bodies.
+pub fn planetary_ring_spec(body_id: &str) -> PlanetaryRingSpec {
+    match body_id {
+        "saturn" => PlanetaryRingSpec {
+            obliquity_deg: 26.73,
+            pole_az_deg: 79.5,
+            ring_mul: 2.28,
+            r_inner_norm: 0.52,
+            ring_alpha: 0.86,
+            color_rgb: [0.92, 0.86, 0.70],
+            cassini_strength: 1.0,
+        },
+        "uranus" => PlanetaryRingSpec {
+            obliquity_deg: 97.77,
+            pole_az_deg: 77.3,
+            ring_mul: 1.72,
+            r_inner_norm: 0.65,
+            ring_alpha: 0.44,
+            color_rgb: [0.64, 0.80, 0.86],
+            cassini_strength: 0.45,
+        },
+        "neptune" => PlanetaryRingSpec {
+            obliquity_deg: 28.32,
+            pole_az_deg: 40.6,
+            ring_mul: 1.62,
+            r_inner_norm: 0.67,
+            ring_alpha: 0.34,
+            color_rgb: [0.56, 0.68, 0.88],
+            cassini_strength: 0.35,
+        },
+        "jupiter" => PlanetaryRingSpec {
+            obliquity_deg: 3.13,
+            pole_az_deg: 248.0,
+            ring_mul: 1.50,
+            r_inner_norm: 0.70,
+            ring_alpha: 0.28,
+            color_rgb: [0.78, 0.68, 0.56],
+            cassini_strength: 0.20,
+        },
+        "haumea" => PlanetaryRingSpec {
+            obliquity_deg: 28.20,
+            pole_az_deg: 122.1,
+            ring_mul: 1.85,
+            r_inner_norm: 0.62,
+            ring_alpha: 0.52,
+            color_rgb: [0.85, 0.90, 0.95],
+            cassini_strength: 0.30,
+        },
+        _ => PlanetaryRingSpec {
+            obliquity_deg: 23.0,
+            pole_az_deg: 60.0,
+            ring_mul: 1.55,
+            r_inner_norm: 0.64,
+            ring_alpha: 0.34,
+            color_rgb: [0.88, 0.84, 0.74],
+            cassini_strength: 0.30,
+        },
+    }
+}
+
+/// Returns orthonormal 3D ring-plane basis `(ring_u, ring_v, ring_normal)` tilted by planetary obliquity.
+pub fn planetary_ring_basis(body_id: &str) -> (Vec3d, Vec3d, Vec3d) {
+    let spec = planetary_ring_spec(body_id);
+    let obliq = spec.obliquity_deg.to_radians();
+    let az = spec.pole_az_deg.to_radians();
+    let ring_normal = Vec3d::new(
+        obliq.sin() * az.cos(),
+        obliq.cos(),
+        obliq.sin() * az.sin(),
+    )
+    .normalized();
+    let ref_vec = if ring_normal.y.abs() > 0.92 {
+        Vec3d::new(0.0, 0.0, 1.0)
+    } else {
+        Vec3d::new(0.0, 1.0, 0.0)
+    };
+    let ring_u = ref_vec.cross(ring_normal).normalized();
+    let ring_v = ring_normal.cross(ring_u).normalized();
+    (ring_u, ring_v, ring_normal)
+}
+
+/// Samples a closed Keplerian orbit uniformly in eccentric anomaly `E` in `[0, TAU]`,
+/// preserving dense curvature around perihelion for high-eccentricity comets.
+pub fn sample_orbit_ribbon_points_au(body: &CelestialBody, steps: usize) -> Vec<Vec3d> {
+    let n = steps.max(12);
+    (0..=n)
+        .map(|s| {
+            let ecc_anom = (s as f64 / n as f64) * TAU;
+            kepler_position_from_eccentric_anomaly_au(
+                body.semi_major_axis_au,
+                body.eccentricity,
+                body.inclination_deg,
+                body.lon_ascending_node_deg,
+                body.arg_periapsis_deg,
+                ecc_anom,
+            )
+        })
+        .collect()
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct GpuVertex {
     clip_pos: [f32; 2],
     uv: [f32; 2],
     color: [f32; 4],
     kind_param: [f32; 2],
+    extra: [f32; 4],
 }
 
 impl GpuVertex {
-    const BYTE_STRIDE: u64 = 40;
+    const BYTE_STRIDE: u64 = 56;
 
     fn write_le_bytes(self, out: &mut Vec<u8>) {
         for v in [
@@ -141,6 +276,10 @@ impl GpuVertex {
             self.color[3],
             self.kind_param[0],
             self.kind_param[1],
+            self.extra[0],
+            self.extra[1],
+            self.extra[2],
+            self.extra[3],
         ] {
             out.extend_from_slice(&v.to_le_bytes());
         }
@@ -329,18 +468,21 @@ impl<'a> MeshBuilder3D<'a> {
                     uv: uvs[0],
                     color: col,
                     kind_param: [6.0, sheen],
+                    extra: [0.0; 4],
                 },
                 GpuVertex {
                     clip_pos: [q1.0, q1.1],
                     uv: uvs[1],
                     color: col,
                     kind_param: [6.0, sheen],
+                    extra: [0.0; 4],
                 },
                 GpuVertex {
                     clip_pos: [q2.0, q2.1],
                     uv: uvs[2],
                     color: col,
                     kind_param: [6.0, sheen],
+                    extra: [0.0; 4],
                 },
             ],
         });
@@ -1934,6 +2076,47 @@ fn build_surface_patch_and_unit(
     mb.flush_into(out);
 }
 
+fn make_billboard_quad_extra(
+    ndc_x: f32,
+    ndc_y: f32,
+    half_w: f32,
+    half_h: f32,
+    color: [f32; 4],
+    kind: f32,
+    param: f32,
+    extra: [f32; 4],
+) -> [GpuVertex; 6] {
+    let v0 = GpuVertex {
+        clip_pos: [ndc_x - half_w, ndc_y - half_h],
+        uv: [-1.0, -1.0],
+        color,
+        kind_param: [kind, param],
+        extra,
+    };
+    let v1 = GpuVertex {
+        clip_pos: [ndc_x + half_w, ndc_y - half_h],
+        uv: [1.0, -1.0],
+        color,
+        kind_param: [kind, param],
+        extra,
+    };
+    let v2 = GpuVertex {
+        clip_pos: [ndc_x + half_w, ndc_y + half_h],
+        uv: [1.0, 1.0],
+        color,
+        kind_param: [kind, param],
+        extra,
+    };
+    let v3 = GpuVertex {
+        clip_pos: [ndc_x - half_w, ndc_y + half_h],
+        uv: [-1.0, 1.0],
+        color,
+        kind_param: [kind, param],
+        extra,
+    };
+    [v0, v1, v2, v0, v2, v3]
+}
+
 fn make_billboard_quad(
     ndc_x: f32,
     ndc_y: f32,
@@ -1943,31 +2126,7 @@ fn make_billboard_quad(
     kind: f32,
     param: f32,
 ) -> [GpuVertex; 6] {
-    let v0 = GpuVertex {
-        clip_pos: [ndc_x - half_w, ndc_y - half_h],
-        uv: [-1.0, -1.0],
-        color,
-        kind_param: [kind, param],
-    };
-    let v1 = GpuVertex {
-        clip_pos: [ndc_x + half_w, ndc_y - half_h],
-        uv: [1.0, -1.0],
-        color,
-        kind_param: [kind, param],
-    };
-    let v2 = GpuVertex {
-        clip_pos: [ndc_x + half_w, ndc_y + half_h],
-        uv: [1.0, 1.0],
-        color,
-        kind_param: [kind, param],
-    };
-    let v3 = GpuVertex {
-        clip_pos: [ndc_x - half_w, ndc_y + half_h],
-        uv: [-1.0, 1.0],
-        color,
-        kind_param: [kind, param],
-    };
-    [v0, v1, v2, v0, v2, v3]
+    make_billboard_quad_extra(ndc_x, ndc_y, half_w, half_h, color, kind, param, [0.0; 4])
 }
 
 fn make_line_ribbon(
@@ -1990,24 +2149,28 @@ fn make_line_ribbon(
         uv: [0.0, -1.0],
         color,
         kind_param: [4.0, 0.0],
+        extra: [0.0; 4],
     };
     let v1 = GpuVertex {
         clip_pos: [b.0 - nx, b.1 - ny],
         uv: [1.0, -1.0],
         color,
         kind_param: [4.0, 0.0],
+        extra: [0.0; 4],
     };
     let v2 = GpuVertex {
         clip_pos: [b.0 + nx, b.1 + ny],
         uv: [1.0, 1.0],
         color,
         kind_param: [4.0, 0.0],
+        extra: [0.0; 4],
     };
     let v3 = GpuVertex {
         clip_pos: [a.0 + nx, a.1 + ny],
         uv: [0.0, 1.0],
         color,
         kind_param: [4.0, 0.0],
+        extra: [0.0; 4],
     };
     Some([v0, v1, v2, v0, v2, v3])
 }
@@ -2090,23 +2253,16 @@ pub fn build_cosmos_frame(
                     | BodyCategory::Comet
             ) && body.semi_major_axis_au > 0.0
             {
-                let steps = if body.category == BodyCategory::Comet { 144usize } else { 72usize };
+                let steps = if body.category == BodyCategory::Comet || body.eccentricity > 0.35 {
+                    192usize
+                } else {
+                    72usize
+                };
                 let is_sel = body.id == selected_id;
                 let alpha = if is_sel { 0.62 } else { 0.22 };
                 let col = [body.color_rgb[0], body.color_rgb[1], body.color_rgb[2], alpha];
                 let mut prev: Option<(f32, f32, f64)> = None;
-                for s in 0..=steps {
-                    let frac = (s as f64) / (steps as f64);
-                    let pos_au = kepler_position_au(
-                        body.semi_major_axis_au,
-                        body.eccentricity,
-                        body.inclination_deg,
-                        body.lon_ascending_node_deg,
-                        body.arg_periapsis_deg,
-                        frac * 360.0,
-                        0.0,
-                        0.0,
-                    );
+                for pos_au in sample_orbit_ribbon_points_au(body, steps) {
                     let world = compress_au_to_scene(pos_au);
                     let cur = camera.project(world, aspect);
                     if let (Some(p0), Some(p1)) = (prev, cur) {
@@ -2288,6 +2444,7 @@ pub fn build_cosmos_frame(
             let max_ndc_y = 1.65 + half_h.min(12.0);
 
             if nx.abs() <= max_ndc_x && ny.abs() <= max_ndc_y {
+                let light_view = body_sun_light_view_space(camera, world);
                 let sun_angle = world.z.atan2(world.x) as f32 + 3.14159;
                 let (kind, draw_hw, draw_hh, body_alpha) = match body.category {
                     BodyCategory::Star => (0.0, half_w, half_h, 1.0),
@@ -2303,7 +2460,7 @@ pub fn build_cosmos_frame(
 
                 quads.push(DepthGeom::Quad {
                     depth,
-                    verts: make_billboard_quad(
+                    verts: make_billboard_quad_extra(
                         nx,
                         ny,
                         draw_hw,
@@ -2311,29 +2468,98 @@ pub fn build_cosmos_frame(
                         [body.color_rgb[0], body.color_rgb[1], body.color_rgb[2], body_alpha],
                         kind,
                         param,
+                        [light_view[0], light_view[1], light_view[2], 0.0],
                     ),
                 });
 
                 if body.has_rings && body.category != BodyCategory::Nebula {
-                    let (ring_mul, ring_alpha) = if body.id == "saturn" {
-                        (2.22, 0.85)
-                    } else if body.id == "haumea" {
-                        (1.85, 0.48)
+                    let spec = planetary_ring_spec(&body.id);
+                    let (ring_u, ring_v, ring_n) = planetary_ring_basis(&body.id);
+                    let apparent_world_r = (half_h as f64) / proj_scale.max(1e-6);
+                    let r_outer = apparent_world_r * spec.ring_mul;
+                    let r_inner = r_outer * spec.r_inner_norm;
+                    let to_sun = if world.length() > 1e-6 {
+                        world.scale(-1.0).normalized()
                     } else {
-                        (1.48, 0.30)
+                        Vec3d::new(0.0, 1.0, 0.0)
                     };
-                    quads.push(DepthGeom::Quad {
-                        depth: depth - 0.01,
-                        verts: make_billboard_quad(
-                            nx,
-                            ny,
-                            half_w * ring_mul,
-                            half_h * ring_mul,
-                            [0.92, 0.86, 0.70, ring_alpha],
-                            3.0,
-                            anim_time_sec as f32,
-                        ),
-                    });
+                    let sun_grazing = (0.78 + 0.28 * ring_n.dot(to_sun).abs()) as f32;
+                    let ring_segs = 56usize;
+                    let ri = spec.r_inner_norm as f32;
+                    let col = [
+                        spec.color_rgb[0],
+                        spec.color_rgb[1],
+                        spec.color_rgb[2],
+                        spec.ring_alpha,
+                    ];
+
+                    for s in 0..ring_segs {
+                        let t0 = (s as f64 / ring_segs as f64) * TAU;
+                        let t1 = ((s + 1) as f64 / ring_segs as f64) * TAU;
+                        let d0 = ring_u.scale(t0.cos()).add(ring_v.scale(t0.sin()));
+                        let d1 = ring_u.scale(t1.cos()).add(ring_v.scale(t1.sin()));
+                        let w_in0 = world.add(d0.scale(r_inner));
+                        let w_out0 = world.add(d0.scale(r_outer));
+                        let w_out1 = world.add(d1.scale(r_outer));
+                        let w_in1 = world.add(d1.scale(r_inner));
+
+                        let (Some(q_in0), Some(q_out0), Some(q_out1), Some(q_in1)) = (
+                            camera.project(w_in0, aspect),
+                            camera.project(w_out0, aspect),
+                            camera.project(w_out1, aspect),
+                            camera.project(w_in1, aspect),
+                        ) else {
+                            continue;
+                        };
+
+                        let tm = 0.5 * (t0 + t1);
+                        let dm = ring_u.scale(tm.cos()).add(ring_v.scale(tm.sin()));
+                        let r_mid = 0.5 * (r_inner + r_outer);
+                        let mid_rel = dm.scale(r_mid);
+                        let along_sun = mid_rel.dot(to_sun);
+                        let perp_dist = mid_rel.sub(to_sun.scale(along_sun)).length();
+                        let shadow_fac = if along_sun < 0.0 && perp_dist < apparent_world_r * 1.02 {
+                            let edge = ((perp_dist / apparent_world_r.max(1e-6)) - 0.85) / 0.17;
+                            0.24 + 0.76 * edge.clamp(0.0, 1.0)
+                        } else {
+                            1.0
+                        };
+                        let sun_lit = (sun_grazing * (shadow_fac as f32)).clamp(0.18, 1.12);
+                        let seg_depth = 0.25 * (q_in0.2 + q_out0.2 + q_out1.2 + q_in1.2);
+                        let extra = [ri, sun_lit, spec.cassini_strength, 0.0];
+                        let v_in0 = GpuVertex {
+                            clip_pos: [q_in0.0, q_in0.1],
+                            uv: [ri * t0.cos() as f32, ri * t0.sin() as f32],
+                            color: col,
+                            kind_param: [3.0, anim_time_sec as f32],
+                            extra,
+                        };
+                        let v_out0 = GpuVertex {
+                            clip_pos: [q_out0.0, q_out0.1],
+                            uv: [t0.cos() as f32, t0.sin() as f32],
+                            color: col,
+                            kind_param: [3.0, anim_time_sec as f32],
+                            extra,
+                        };
+                        let v_out1 = GpuVertex {
+                            clip_pos: [q_out1.0, q_out1.1],
+                            uv: [t1.cos() as f32, t1.sin() as f32],
+                            color: col,
+                            kind_param: [3.0, anim_time_sec as f32],
+                            extra,
+                        };
+                        let v_in1 = GpuVertex {
+                            clip_pos: [q_in1.0, q_in1.1],
+                            uv: [ri * t1.cos() as f32, ri * t1.sin() as f32],
+                            color: col,
+                            kind_param: [3.0, anim_time_sec as f32],
+                            extra,
+                        };
+                        quads.push(DepthGeom::Quad {
+                            depth: seg_depth,
+                            verts: [v_in0, v_out0, v_out1, v_in0, v_out1, v_in1],
+                        });
+                    }
                 }
 
                 if let Some((scan_id, pulse_age)) = active_scan_pulse {
@@ -2641,7 +2867,7 @@ pub fn build_cosmos_frame(
 
     quads.sort_by(|a, b| b.depth().total_cmp(&a.depth()));
 
-    let mut vertex_bytes = Vec::with_capacity(quads.len() * 6 * 40);
+    let mut vertex_bytes = Vec::with_capacity(quads.len() * 6 * (GpuVertex::BYTE_STRIDE as usize));
     let mut vertex_count = 0u32;
     for q in &quads {
         match q {
@@ -2707,6 +2933,11 @@ impl CosmosGpuPipeline {
                 format: wgpu::VertexFormat::Float32x2,
                 offset: 32,
                 shader_location: 3,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x4,
+                offset: 40,
+                shader_location: 4,
             },
         ];
 

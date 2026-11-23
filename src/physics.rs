@@ -111,6 +111,38 @@ pub fn solve_kepler_eccentric_anomaly(mean_anomaly_rad: f64, eccentricity: f64) 
     ecc
 }
 
+/// Computes physical J2000 3D ecliptic position `(x, y_up = z_ecl, z = y_ecl)` in AU
+/// directly from eccentric anomaly `E` (radians), avoiding mean-anomaly clustering near aphelion.
+pub fn kepler_position_from_eccentric_anomaly_au(
+    semi_major_axis_au: f64,
+    eccentricity: f64,
+    inclination_deg: f64,
+    lon_asc_node_deg: f64,
+    arg_periapsis_deg: f64,
+    eccentric_anomaly_rad: f64,
+) -> Vec3d {
+    if semi_major_axis_au <= 0.0 {
+        return Vec3d::default();
+    }
+    let e = eccentricity.clamp(0.0, 0.999_995);
+    let true_anom = 2.0
+        * ((1.0 + e).sqrt() * (eccentric_anomaly_rad * 0.5).sin())
+            .atan2((1.0 - e).sqrt() * (eccentric_anomaly_rad * 0.5).cos());
+    let r = semi_major_axis_au * (1.0 - e * eccentric_anomaly_rad.cos());
+
+    let inc = inclination_deg.to_radians();
+    let om = lon_asc_node_deg.to_radians();
+    let w = arg_periapsis_deg.to_radians();
+    let u = w + true_anom;
+
+    let x_ecl = r * (om.cos() * u.cos() - om.sin() * u.sin() * inc.cos());
+    let y_ecl = r * (om.sin() * u.cos() + om.cos() * u.sin() * inc.cos());
+    let z_ecl = r * (u.sin() * inc.sin());
+
+    // Map ecliptic (x_ecl, y_ecl, z_ecl) -> 3D scene (x, y_up = z_ecl, z = y_ecl)
+    Vec3d::new(x_ecl, z_ecl, y_ecl)
+}
+
 /// Computes physical J2000 3D ecliptic position `(x, z_ecliptic_y, y_up)` in AU at `days_since_j2000`.
 /// Note: `y` is vertical above the ecliptic plane so 3D camera up-axis is `+Y`.
 pub fn kepler_position_au(
@@ -133,22 +165,14 @@ pub fn kepler_position_au(
     };
     let m = mean_anomaly_j2000_deg.to_radians() + mean_motion * days_since_j2000;
     let ecc = solve_kepler_eccentric_anomaly(m, eccentricity);
-    let true_anom = 2.0
-        * ((1.0 + eccentricity).sqrt() * (ecc * 0.5).sin())
-            .atan2((1.0 - eccentricity).sqrt() * (ecc * 0.5).cos());
-    let r = semi_major_axis_au * (1.0 - eccentricity * ecc.cos());
-
-    let inc = inclination_deg.to_radians();
-    let om = lon_asc_node_deg.to_radians();
-    let w = arg_periapsis_deg.to_radians();
-    let u = w + true_anom;
-
-    let x_ecl = r * (om.cos() * u.cos() - om.sin() * u.sin() * inc.cos());
-    let y_ecl = r * (om.sin() * u.cos() + om.cos() * u.sin() * inc.cos());
-    let z_ecl = r * (u.sin() * inc.sin());
-
-    // Map ecliptic (x_ecl, y_ecl, z_ecl) -> 3D scene (x, y_up = z_ecl, z = y_ecl)
-    Vec3d::new(x_ecl, z_ecl, y_ecl)
+    kepler_position_from_eccentric_anomaly_au(
+        semi_major_axis_au,
+        eccentricity,
+        inclination_deg,
+        lon_asc_node_deg,
+        arg_periapsis_deg,
+        ecc,
+    )
 }
 
 /// Evaluates Stumpff functions `C(z)` and `S(z)` with Taylor series continuity near `z = 0`
@@ -497,23 +521,63 @@ pub fn body_scene_position_with_offsets(
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct CaptureOrbitSolution {
+    pub altitude_km: f64,
+    pub periapsis_radius_km: f64,
+    pub eccentricity: f64,
+    pub capture_orbit_vel_km_s: f64,
+    pub capture_dv_km_s: f64,
+}
+
+/// Computes arrival orbit insertion parameters from hyperbolic excess speed `v_inf_arr_km_s`.
+/// Uses `e = 0.60` elliptical capture orbits at outer gas/ice giants (`radius_km > 20,000 km`,
+/// Juno/Cassini class) and circular capture orbits elsewhere, guaranteeing identical capture
+/// delta-v accounting across both the Launcher and the Porkchop / Gravity-Assist solver.
+pub fn compute_capture_orbit(target: &CelestialBody, v_inf_arr_km_s: f64) -> CaptureOrbitSolution {
+    let cap_alt_km = if target.id == "sun" {
+        6_100_000.0
+    } else if target.radius_km < 10.0 {
+        1.5 // close asteroid station-keeping
+    } else if target.radius_km > 20_000.0 {
+        4_500.0 // gas/ice giant cloud-top clearance
+    } else {
+        300.0
+    };
+    let r_cap_km = (target.radius_km + cap_alt_km).max(1.0);
+    let gm_target = target.gm_km3_s2();
+    let e_cap = if target.radius_km > 20_000.0 { 0.60 } else { 0.0 };
+    let v_cap_orb = ((1.0 + e_cap) * gm_target / r_cap_km).sqrt();
+    let v_peri_arr = (v_inf_arr_km_s * v_inf_arr_km_s + 2.0 * gm_target / r_cap_km).sqrt();
+    let dv_arr = (v_peri_arr - v_cap_orb).abs();
+    CaptureOrbitSolution {
+        altitude_km: cap_alt_km,
+        periapsis_radius_km: r_cap_km,
+        eccentricity: e_cap,
+        capture_orbit_vel_km_s: v_cap_orb,
+        capture_dv_km_s: dv_arr,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct TransferSolution {
-    /// Total mission delta-v in `km/s` from 400 km Low Earth Orbit.
+    /// Total mission delta-v in `km/s` from 400 km Low Earth Orbit (or relativistic rapidity delta-v).
     pub total_delta_v_km_s: f64,
     /// Characteristic departure energy `C3 = v_inf^2` in `km^2 / s^2`.
     pub c3_km2_s2: f64,
-    /// Physical Hohmann or relativistic transit time in Earth days.
+    /// Physical Hohmann or coordinate-frame relativistic transit time `t` in Earth days.
     pub physical_flight_days: f64,
-    /// Target circular capture orbit velocity in `km/s`.
+    /// Relativistic ship proper transit time `tau = t / gamma` in days (`== physical_flight_days` for Solar System flights).
+    pub proper_flight_days: f64,
+    /// Target capture orbit periapsis velocity in `km/s`.
     pub capture_orbit_vel_km_s: f64,
-    /// Target circular capture altitude above surface in `km`.
+    /// Target capture periapsis altitude above surface in `km`.
     pub capture_altitude_km: f64,
     /// Lorentz factor `gamma` (`1.0` for non-relativistic Solar System flights).
     pub lorentz_gamma: f64,
 }
 
 /// Computes scientifically grounded Hohmann + patched-conic departure/capture metrics from 400 km LEO,
-/// or relativistic laser-sail/fusion cruise metrics for interstellar exoplanets and nebulae.
+/// or relativistic rapidity (`c * atanh(beta)`) & proper ship time (`tau = t / gamma`) metrics for interstellar targets.
 pub fn compute_transfer_from_earth(
     target: &CelestialBody,
     catalog: &[CelestialBody],
@@ -523,10 +587,17 @@ pub fn compute_transfer_from_earth(
     let v_leo = (GM_EARTH_KM3_S2 / r_leo_km).sqrt(); // ~7.67 km/s
 
     if target.distance_ly > 0.0 {
-        let beta = cruise_beta_c.clamp(0.05, 0.35);
+        let beta = if cruise_beta_c.is_finite() {
+            cruise_beta_c.clamp(0.001, 0.999_999)
+        } else {
+            0.05
+        };
         let gamma = 1.0 / (1.0 - beta * beta).sqrt();
         let flight_years = target.distance_ly / beta;
-        let dv_equiv = beta * SPEED_OF_LIGHT_KM_S;
+        let coord_flight_days = flight_years * 365.25;
+        let proper_flight_days = coord_flight_days / gamma;
+        // Relativistic rocket rapidity delta-v = c * atanh(beta) per boost/deceleration phase
+        let rapidity_dv_km_s = SPEED_OF_LIGHT_KM_S * beta.atanh();
         let (cap_alt, cap_v) = if target.category == BodyCategory::Exoplanet {
             let r_orb = target.radius_km + 500.0;
             (500.0, (target.gm_km3_s2() / r_orb).sqrt())
@@ -535,9 +606,10 @@ pub fn compute_transfer_from_earth(
             (0.0, 0.12)
         };
         return TransferSolution {
-            total_delta_v_km_s: dv_equiv,
+            total_delta_v_km_s: 2.0 * rapidity_dv_km_s + cap_v,
             c3_km2_s2: 185.0,
-            physical_flight_days: flight_years * 365.25,
+            physical_flight_days: coord_flight_days,
+            proper_flight_days,
             capture_orbit_vel_km_s: cap_v,
             capture_altitude_km: cap_alt,
             lorentz_gamma: gamma,
@@ -549,6 +621,7 @@ pub fn compute_transfer_from_earth(
             total_delta_v_km_s: 0.15,
             c3_km2_s2: 0.0,
             physical_flight_days: 0.06,
+            proper_flight_days: 0.06,
             capture_orbit_vel_km_s: v_leo,
             capture_altitude_km: LEO_ALTITUDE_KM,
             lorentz_gamma: 1.0,
@@ -563,6 +636,7 @@ pub fn compute_transfer_from_earth(
             total_delta_v_km_s: 3.98,
             c3_km2_s2: -1.9,
             physical_flight_days: 3.6,
+            proper_flight_days: 3.6,
             capture_orbit_vel_km_s: v_lunar_orb,
             capture_altitude_km: 100.0,
             lorentz_gamma: 1.0,
@@ -575,6 +649,7 @@ pub fn compute_transfer_from_earth(
             total_delta_v_km_s: 3.20,
             c3_km2_s2: -0.62,
             physical_flight_days: 29.5,
+            proper_flight_days: 29.5,
             capture_orbit_vel_km_s: 0.28,
             capture_altitude_km: 500_000.0,
             lorentz_gamma: 1.0,
@@ -609,29 +684,16 @@ pub fn compute_transfer_from_earth(
     let v_trans_arr = (GM_SUN_KM3_S2 * (2.0 / r2_km - 1.0 / a_trans)).sqrt();
     let v_inf_arr = (v_target_helio - v_trans_arr).abs();
 
-    let cap_alt_km = if target.id == "sun" {
-        6_100_000.0
-    } else if target.radius_km < 10.0 {
-        1.5 // close asteroid station-keeping
-    } else if target.radius_km > 20_000.0 {
-        4_500.0 // gas/ice giant cloud-top clearance
-    } else {
-        300.0
-    };
-    let r_cap_km = target.radius_km + cap_alt_km;
-    let gm_target = target.gm_km3_s2();
-    let v_cap_circ = (gm_target / r_cap_km.max(1.0)).sqrt();
-    let v_periapsis_arr = (v_inf_arr * v_inf_arr + 2.0 * gm_target / r_cap_km.max(1.0)).sqrt();
-    // Apply realistic Oberth/gravity-assist braking cap for outer giants
-    let dv_arr = (v_periapsis_arr - v_cap_circ).abs().min(8.5);
-
+    let cap = compute_capture_orbit(target, v_inf_arr);
     let flight_seconds = PI * (a_trans.powi(3) / GM_SUN_KM3_S2).sqrt();
+    let flight_days = flight_seconds / 86_400.0;
     TransferSolution {
-        total_delta_v_km_s: dv_dep + dv_arr,
+        total_delta_v_km_s: dv_dep + cap.capture_dv_km_s,
         c3_km2_s2: c3,
-        physical_flight_days: flight_seconds / 86_400.0,
-        capture_orbit_vel_km_s: v_cap_circ,
-        capture_altitude_km: cap_alt_km,
+        physical_flight_days: flight_days,
+        proper_flight_days: flight_days,
+        capture_orbit_vel_km_s: cap.capture_orbit_vel_km_s,
+        capture_altitude_km: cap.altitude_km,
         lorentz_gamma: 1.0,
     }
 }

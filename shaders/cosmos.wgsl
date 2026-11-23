@@ -22,6 +22,7 @@ struct VertexInput {
     @location(1) uv: vec2<f32>,
     @location(2) color: vec4<f32>,
     @location(3) kind_param: vec2<f32>,
+    @location(4) extra: vec4<f32>,
 };
 
 struct VertexOutput {
@@ -29,6 +30,7 @@ struct VertexOutput {
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
     @location(2) kind_param: vec2<f32>,
+    @location(3) extra: vec4<f32>,
 };
 
 @vertex
@@ -38,6 +40,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.uv = in.uv;
     out.color = in.color;
     out.kind_param = in.kind_param;
+    out.extra = in.extra;
     return out;
 }
 
@@ -62,19 +65,24 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(col, alpha);
     }
 
-    // 1: 3D Lit Planetary / Lunar / Asteroid Sphere
+    // 1: 3D Lit Planetary / Lunar / Asteroid Sphere (body-to-Sun vector in camera view space)
     if (kind == 1) {
         if (r > 1.0) {
             discard;
         }
         let nz = sqrt(max(0.0, 1.0 - r2));
         let normal = normalize(vec3<f32>(p.x, p.y, nz + 0.0001));
-        let light_dir = normalize(vec3<f32>(cos(phase), 0.28, sin(phase) * 0.5 + 0.55));
+        let light_len = length(in.extra.xyz);
+        let light_dir = select(
+            normalize(vec3<f32>(cos(phase), 0.28, sin(phase) * 0.5 + 0.55)),
+            in.extra.xyz / light_len,
+            light_len > 0.01
+        );
         let ndotl = max(dot(normal, light_dir), 0.0);
         let bands = 0.93 + 0.07 * sin(p.y * 14.0 + p.x * 2.5);
         let one_minus_nz = max(0.0, 1.0 - nz);
-        let rim = one_minus_nz * one_minus_nz * one_minus_nz * 0.35;
-        let lit = in.color.rgb * bands * (0.16 + 0.88 * ndotl) + in.color.rgb * rim;
+        let rim = one_minus_nz * one_minus_nz * one_minus_nz * 0.34 * (0.22 + 0.78 * ndotl);
+        let lit = in.color.rgb * bands * (0.08 + 0.92 * ndotl) + in.color.rgb * rim;
         let edge_aa = smoothstep(1.0, 0.94, r);
         return vec4<f32>(lit, edge_aa * in.color.a);
     }
@@ -91,17 +99,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(filament_col, clamp(shell + core_glow, 0.0, 0.88) * in.color.a);
     }
 
-    // 3: Planetary Ring / Nebula Torus SDF
+    // 3: 3D Obliquity-Tilted Planetary Ring Annulus
     if (kind == 3) {
-        let q = vec2<f32>(p.x, p.y * 2.35);
-        let rr = length(q);
-        if (rr < 0.46 || rr > 1.0) {
+        let rr = length(p);
+        let r_in = clamp(in.extra.x, 0.35, 0.90);
+        if (rr < r_in || rr > 1.0) {
             discard;
         }
-        let cassini_gap = smoothstep(0.015, 0.04, abs(rr - 0.74));
-        let fine_ringlets = 0.8 + 0.2 * sin(rr * 65.0);
-        let fade = smoothstep(0.46, 0.52, rr) * smoothstep(1.0, 0.92, rr);
-        return vec4<f32>(in.color.rgb * fine_ringlets, fade * cassini_gap * in.color.a * 0.78);
+        let cassini_pos = mix(r_in, 1.0, 0.56);
+        let cassini_gap = mix(1.0, smoothstep(0.010, 0.032, abs(rr - cassini_pos)), in.extra.z);
+        let fine_ringlets = 0.82 + 0.18 * sin(rr * 72.0);
+        let fade = smoothstep(r_in, r_in + 0.04, rr) * smoothstep(1.0, 0.94, rr);
+        let sun_lit = clamp(in.extra.y, 0.18, 1.15);
+        return vec4<f32>(in.color.rgb * fine_ringlets * sun_lit, fade * cassini_gap * in.color.a);
     }
 
     // 4: Solid / Ribbon Geometry (Orbits, Trajectories, Probe Bus Hull)

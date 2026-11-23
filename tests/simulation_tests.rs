@@ -1069,3 +1069,200 @@ fn gravity_assist_consistent_3d_accounting_on_halley_and_all_candidates() {
         }
     }
 }
+
+#[test]
+fn halley_ion_tail_aberration_matches_physical_formula_within_one_degree() {
+    use helioprobe::l2_comets::compute_comet_tail_state;
+    use helioprobe::physics::{kepler_state_ecliptic_km, AU_KM, GM_SUN_KM3_S2};
+
+    let catalog = bootstrap_catalog();
+    let halley = catalog.iter().find(|b| b.id == "halley_1p").expect("halley_1p");
+
+    // Sample across perihelion, inbound, outbound, and outer-arc anomalies
+    for offset_deg in [0.0, 293.0, 296.0, 300.0, 305.0, 320.0, 45.0, 140.0] {
+        let epoch = 9814.5;
+        let tail = compute_comet_tail_state(halley, epoch, offset_deg);
+        let (r_ecl, v_ecl) = kepler_state_ecliptic_km(halley, epoch, offset_deg);
+        let r_hat = Vec3d::new(r_ecl.x, r_ecl.z, r_ecl.y).normalized();
+        let v_phys = Vec3d::new(v_ecl.x, v_ecl.z, v_ecl.y);
+
+        let v_r = v_phys.dot(r_hat);
+        let v_perp = v_phys.sub(r_hat.scale(v_r)).length();
+        let v_sw = tail.solar_wind_km_s;
+        let expected_aberration_deg = v_perp.atan2(v_sw - v_r).to_degrees();
+
+        let actual_aberration_deg = tail
+            .ion_tail_dir_scene
+            .dot(tail.anti_sun_dir_scene)
+            .clamp(-1.0, 1.0)
+            .acos()
+            .to_degrees();
+
+        assert!(
+            (actual_aberration_deg - expected_aberration_deg).abs() < 1.0,
+            "Halley ion-tail aberration error > 1 deg at off={offset_deg}: actual={actual_aberration_deg:.4}, expected={expected_aberration_deg:.4}"
+        );
+        assert!((tail.ion_aberration_deg - expected_aberration_deg).abs() < 1e-6);
+
+        let r_km = r_ecl.length().max(0.08 * AU_KM);
+        let a_km = halley.semi_major_axis_au * AU_KM;
+        let vis_viva = (GM_SUN_KM3_S2 * (2.0 / r_km - 1.0 / a_km)).sqrt();
+        assert!((tail.orbital_speed_km_s - vis_viva).abs() < 1e-6);
+    }
+}
+
+#[test]
+fn launcher_and_porkchop_giant_planet_capture_dv_reconciled() {
+    use helioprobe::astrodynamics_lab::target_capture_dv;
+    use helioprobe::physics::{
+        compute_capture_orbit, AU_KM, EARTH_RADIUS_KM, GM_EARTH_KM3_S2, GM_SUN_KM3_S2,
+        LEO_ALTITUDE_KM,
+    };
+
+    let catalog = bootstrap_catalog();
+    let r_leo_km = EARTH_RADIUS_KM + LEO_ALTITUDE_KM;
+    let v_leo = (GM_EARTH_KM3_S2 / r_leo_km).sqrt();
+    let r1_km = AU_KM;
+    let v_earth_helio = (GM_SUN_KM3_S2 / r1_km).sqrt();
+
+    for id in ["jupiter", "saturn", "uranus", "neptune"] {
+        let planet = catalog.iter().find(|b| b.id == id).expect(id);
+        let xfer = compute_transfer_from_earth(planet, &catalog, 0.05);
+
+        let r2_km = planet.semi_major_axis_au * AU_KM;
+        let a_trans = 0.5 * (r1_km + r2_km);
+        let v_trans_dep = (GM_SUN_KM3_S2 * (2.0 / r1_km - 1.0 / a_trans)).sqrt();
+        let v_inf_dep = (v_trans_dep - v_earth_helio).abs();
+        let dv_dep = ((v_inf_dep * v_inf_dep + 2.0 * GM_EARTH_KM3_S2 / r_leo_km).sqrt() - v_leo).abs();
+
+        let v_target_helio = (GM_SUN_KM3_S2 / r2_km).sqrt();
+        let v_trans_arr = (GM_SUN_KM3_S2 * (2.0 / r2_km - 1.0 / a_trans)).sqrt();
+        let v_inf_arr = (v_target_helio - v_trans_arr).abs();
+
+        let cap = compute_capture_orbit(planet, v_inf_arr);
+        let porkchop_cap_dv = target_capture_dv(planet, v_inf_arr);
+        assert!(
+            (cap.capture_dv_km_s - porkchop_cap_dv).abs() < 1e-12,
+            "Capture math mismatch for {id}: launcher={}, porkchop={}",
+            cap.capture_dv_km_s,
+            porkchop_cap_dv
+        );
+        assert!((cap.eccentricity - 0.60).abs() < 1e-12);
+        assert!((xfer.total_delta_v_km_s - (dv_dep + porkchop_cap_dv)).abs() < 1e-9);
+        assert!((xfer.capture_orbit_vel_km_s - cap.capture_orbit_vel_km_s).abs() < 1e-12);
+
+        if id == "jupiter" || id == "saturn" {
+            let grid = compute_porkchop_grid(planet, &catalog, 9814.5, 28, 20);
+            assert!(
+                (grid.min_dv_km_s - xfer.total_delta_v_km_s).abs() < 1.5,
+                "Launcher vs Porkchop basin dV diverged on {id}: launcher={:.2}, porkchop_min={:.2}",
+                xfer.total_delta_v_km_s,
+                grid.min_dv_km_s
+            );
+        }
+    }
+}
+
+#[test]
+fn relativistic_interstellar_rapidity_proper_time_and_hill_cr3bp_verified() {
+    use helioprobe::l2_comets::{compute_sun_earth_l2_dynamics, sun_earth_l2_halo_position};
+    use helioprobe::physics::{AU_KM, GM_EARTH_KM3_S2, GM_SUN_KM3_S2, SPEED_OF_LIGHT_KM_S};
+
+    let catalog = bootstrap_catalog();
+    let proxima = catalog.iter().find(|b| b.id == "proxima_b").expect("proxima_b");
+
+    for raw_beta in [0.05, 0.20, 0.38, 0.75, 0.92] {
+        let xfer = compute_transfer_from_earth(proxima, &catalog, raw_beta);
+        let expected_gamma = 1.0 / (1.0 - raw_beta * raw_beta).sqrt();
+        assert!((xfer.lorentz_gamma - expected_gamma).abs() < 1e-9);
+        assert!(
+            xfer.total_delta_v_km_s >= SPEED_OF_LIGHT_KM_S * raw_beta.atanh(),
+            "Interstellar dV must be >= c * atanh(beta): dv={}, rapidity={}",
+            xfer.total_delta_v_km_s,
+            SPEED_OF_LIGHT_KM_S * raw_beta.atanh()
+        );
+        assert!(xfer.total_delta_v_km_s > raw_beta * SPEED_OF_LIGHT_KM_S);
+        let expected_tau = xfer.physical_flight_days / xfer.lorentz_gamma;
+        assert!((xfer.proper_flight_days - expected_tau).abs() < 1e-9);
+    }
+
+    // Edge-case guards: beta >= 1.0, beta <= 0.0, NaN must stay strictly subluminal and finite
+    for edge_beta in [-0.4, 0.0, 1.0, 1.8, f64::NAN] {
+        let xfer = compute_transfer_from_earth(proxima, &catalog, edge_beta);
+        assert!(xfer.lorentz_gamma.is_finite() && xfer.lorentz_gamma >= 1.0);
+        assert!(xfer.total_delta_v_km_s.is_finite() && xfer.total_delta_v_km_s > 0.0);
+        assert!(xfer.proper_flight_days.is_finite() && xfer.proper_flight_days > 0.0);
+    }
+
+    // Sun-Earth L2 Hill radius and linearized CR3BP halo/vertical frequencies
+    let l2 = compute_sun_earth_l2_dynamics();
+    let expected_hill = AU_KM * (GM_EARTH_KM3_S2 / (3.0 * GM_SUN_KM3_S2)).cbrt();
+    assert!((l2.hill_radius_km - expected_hill).abs() < 1.0);
+    assert!(l2.l2_distance_km > 1.49e6 && l2.l2_distance_km < 1.52e6);
+    assert!(l2.c2 > 3.90 && l2.c2 < 4.00);
+    assert!(l2.period_xy_days > 175.0 && l2.period_xy_days < 180.0);
+    assert!(l2.period_z_days > 181.0 && l2.period_z_days < 187.0);
+    assert!(l2.omega_xy_rad_day > l2.omega_z_rad_day);
+
+    let earth = catalog.iter().find(|b| b.id == "earth").expect("earth");
+    let e_pos = body_scene_position(earth, &catalog, 9814.5);
+    let h0 = sun_earth_l2_halo_position(e_pos, 9814.5, 0.0, 0.48);
+    let h1 = sun_earth_l2_halo_position(e_pos, 9814.5 + l2.period_xy_days, 0.0, 0.48);
+    assert!(h0.sub(h1).length() < 0.35);
+}
+
+#[test]
+fn renderer_3d_sun_lighting_ring_obliquity_and_eccentric_anomaly_sampling() {
+    use helioprobe::renderer_3d::{
+        body_sun_light_view_space, planetary_ring_basis, planetary_ring_spec,
+        sample_orbit_ribbon_points_au,
+    };
+
+    let body_world = Vec3d::new(18.5, 0.0, 0.0);
+
+    // 1. Camera on sunward side looking outward -> dayside (+lz > 0.9)
+    let mut cam = OrbitCamera3D::default();
+    cam.target = body_world;
+    cam.distance = 4.0;
+    cam.pitch_rad = 0.0;
+    cam.yaw_rad = -std::f64::consts::FRAC_PI_2; // eye at (14.5, 0, 0)
+    let l_day = body_sun_light_view_space(&cam, body_world);
+    assert!(l_day[2] > 0.95, "Expected sunward dayside lz > 0.95, got {:?}", l_day);
+
+    // 2. Camera on anti-sunward side looking back toward Sun -> nightside (lz < -0.95)
+    cam.yaw_rad = std::f64::consts::FRAC_PI_2; // eye at (22.5, 0, 0)
+    let l_night = body_sun_light_view_space(&cam, body_world);
+    assert!(l_night[2] < -0.95, "Expected nightside lz < -0.95, got {:?}", l_night);
+
+    // 3. Quadrature view (eye at (18.5, 0, 4.0)) -> left side lit (lx < -0.95)
+    cam.yaw_rad = 0.0;
+    let l_quad = body_sun_light_view_space(&cam, body_world);
+    assert!(l_quad[0] < -0.95, "Expected sunward limb lx < -0.95, got {:?}", l_quad);
+
+    // 4. Planetary ring obliquity + pitch geometry
+    let saturn_spec = planetary_ring_spec("saturn");
+    let uranus_spec = planetary_ring_spec("uranus");
+    assert!((saturn_spec.obliquity_deg - 26.73).abs() < 0.01);
+    assert!((uranus_spec.obliquity_deg - 97.77).abs() < 0.01);
+    let (_, _, saturn_n) = planetary_ring_basis("saturn");
+    let (_, _, uranus_n) = planetary_ring_basis("uranus");
+    assert!(saturn_n.y > 0.85, "Saturn ring normal should be mostly upright");
+    assert!(uranus_n.y.abs() < 0.20, "Uranus ring normal should lie near ecliptic plane");
+
+    // 5. Uniform eccentric anomaly E orbit sampling resolves perihelion curvature cleanly
+    let catalog = bootstrap_catalog();
+    let hale_bopp = catalog
+        .iter()
+        .find(|b| b.id == "hale_bopp_c1995")
+        .expect("hale_bopp");
+    let pts = sample_orbit_ribbon_points_au(hale_bopp, 192);
+    assert_eq!(pts.len(), 193);
+    let expected_q = hale_bopp.semi_major_axis_au * (1.0 - hale_bopp.eccentricity);
+    assert!((pts[0].length() - expected_q).abs() < 1e-6);
+    // Adjacent step from perihelion must stay near perihelion (< 1.5 * q), never jumping across the solar system
+    assert!(
+        pts[1].length() < expected_q * 1.35,
+        "First step from perihelion jumped too far: r1={}, q={expected_q}",
+        pts[1].length()
+    );
+}

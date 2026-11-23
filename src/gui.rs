@@ -19,11 +19,13 @@
 //! - Right Dock: 8-tab Science & Engineering Console (`Scanner`, `L2 & Comets`, `Windows`, `Landers`, `Tech Lab`, `Awards`, `Public Data`, `Saves`)
 
 use crate::astrodynamics_lab::{
-    compute_gravity_assist, compute_porkchop_grid_with_offsets, ASSIST_CANDIDATE_IDS,
+    compute_gravity_assist, compute_porkchop_grid_with_offsets, PorkchopGrid, ASSIST_CANDIDATE_IDS,
 };
 use crate::catalog::{bootstrap_catalog, BodyCategory, CelestialBody, ScanBand};
 use crate::gamification::{AchievementDef, CampaignState, SaveDatabase, ACHIEVEMENTS};
-use crate::l2_comets::{compute_comet_tail_state, L2_OBSERVATORIES};
+use crate::l2_comets::{
+    compute_comet_tail_state, compute_sun_earth_l2_dynamics, L2_OBSERVATORIES,
+};
 use crate::physics::{
     body_scene_position_with_offsets, compute_transfer_from_earth, probe_orbit_radius_scene,
     Vec3d,
@@ -72,30 +74,189 @@ enum CameraTrackMode {
     LanderBotView,
 }
 
-fn porkchop_colormap(norm: f32) -> egui::Color32 {
-    let t = norm.clamp(0.0, 1.0);
-    if t < 0.25 {
-        let u = t / 0.25;
-        egui::Color32::from_rgb(
-            (12.0 + u * 22.0) as u8,
-            (95.0 + u * 135.0) as u8,
-            (185.0 + u * 50.0) as u8,
-        )
-    } else if t < 0.55 {
-        let u = (t - 0.25) / 0.30;
-        egui::Color32::from_rgb(
-            (34.0 + u * 195.0) as u8,
-            (230.0 - u * 45.0) as u8,
-            (235.0 - u * 175.0) as u8,
-        )
-    } else {
-        let u = (t - 0.55) / 0.45;
-        egui::Color32::from_rgb(
-            (229.0 + u * 20.0) as u8,
-            (185.0 - u * 145.0) as u8,
-            (60.0 + u * 35.0) as u8,
-        )
+/// Perceptually uniform 11-stop Viridis-class scientific colormap for Porkchop `delta_v` contours.
+pub fn porkchop_colormap(norm: f32) -> egui::Color32 {
+    const VIRIDIS: [[f32; 3]; 11] = [
+        [68.0, 1.0, 84.0],
+        [72.0, 36.0, 117.0],
+        [65.0, 68.0, 135.0],
+        [53.0, 95.0, 141.0],
+        [42.0, 120.0, 142.0],
+        [33.0, 145.0, 140.0],
+        [34.0, 168.0, 132.0],
+        [68.0, 191.0, 112.0],
+        [122.0, 209.0, 81.0],
+        [189.0, 223.0, 38.0],
+        [253.0, 231.0, 37.0],
+    ];
+    let t = norm.clamp(0.0, 1.0) * (VIRIDIS.len() - 1) as f32;
+    let idx = (t.floor() as usize).min(VIRIDIS.len() - 2);
+    let frac = t - idx as f32;
+    let a = VIRIDIS[idx];
+    let b = VIRIDIS[idx + 1];
+    egui::Color32::from_rgb(
+        (a[0] + (b[0] - a[0]) * frac).round() as u8,
+        (a[1] + (b[1] - a[1]) * frac).round() as u8,
+        (a[2] + (b[2] - a[2]) * frac).round() as u8,
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PorkchopCacheKey {
+    pub target_id: String,
+    pub quantized_days: i64,
+    pub comet_offset_bits: u64,
+    pub cols: usize,
+    pub rows: usize,
+}
+
+impl PorkchopCacheKey {
+    pub fn from_state(
+        target: &CelestialBody,
+        days_since_j2000: f64,
+        comet_offsets: &std::collections::BTreeMap<String, f64>,
+        cols: usize,
+        rows: usize,
+    ) -> Self {
+        let eff_id = if target.category == BodyCategory::Moon {
+            target.parent_id.as_deref().unwrap_or(&target.id)
+        } else {
+            target.id.as_str()
+        };
+        let off = comet_offsets.get(eff_id).copied().unwrap_or(0.0);
+        let norm_off = if off == 0.0 { 0.0 } else { off };
+        Self {
+            target_id: target.id.clone(),
+            quantized_days: (days_since_j2000 * 4.0).round() as i64,
+            comet_offset_bits: norm_off.to_bits(),
+            cols: cols.max(8),
+            rows: rows.max(8),
+        }
     }
+}
+
+#[derive(Debug, Default)]
+pub struct PorkchopCache {
+    last_key: Option<PorkchopCacheKey>,
+    grid: Option<PorkchopGrid>,
+    pub hits: u64,
+    pub misses: u64,
+}
+
+pub fn porkchop_contour_levels(min_dv: f64, max_dv: f64) -> Vec<f64> {
+    let span = max_dv - min_dv;
+    if !span.is_finite() || span <= 0.08 {
+        return Vec::new();
+    }
+    let step = if span < 2.5 {
+        0.5
+    } else if span < 6.0 {
+        1.0
+    } else if span < 14.0 {
+        2.0
+    } else if span < 35.0 {
+        5.0
+    } else {
+        10.0
+    };
+    let mut levels = Vec::with_capacity(7);
+    let inner_ring = min_dv + span * 0.08;
+    levels.push(inner_ring);
+    let mut val = ((min_dv + span * 0.14) / step).ceil() * step;
+    while val < max_dv - span * 0.06 && levels.len() < 7 {
+        if val - inner_ring > step * 0.35 {
+            levels.push(val);
+        }
+        val += step;
+    }
+    levels
+}
+
+/// Extracts marching-squares iso-`delta_v` contour segments in normalized plot UV coordinates
+/// (`x in 0..1`, `y in 0..1` top-to-bottom matching `y_inv = rows - 1 - r`).
+pub fn extract_porkchop_iso_contours(
+    grid: &PorkchopGrid,
+    levels: &[f64],
+) -> Vec<(f64, Vec<([f32; 2], [f32; 2])>)> {
+    if grid.cols < 2 || grid.rows < 2 || grid.dv_km_s.len() < grid.cols * grid.rows {
+        return Vec::new();
+    }
+    let cols_f = grid.cols as f32;
+    let rows_f = grid.rows as f32;
+    let uv_at = |c: usize, r: usize| -> [f32; 2] {
+        [
+            (c as f32 + 0.5) / cols_f,
+            ((grid.rows - 1 - r) as f32 + 0.5) / rows_f,
+        ]
+    };
+    let interp = |pa: [f32; 2], va: f64, pb: [f32; 2], vb: f64, lvl: f64| -> [f32; 2] {
+        let denom = vb - va;
+        let t = if denom.abs() > 1e-12 {
+            ((lvl - va) / denom).clamp(0.0, 1.0) as f32
+        } else {
+            0.5
+        };
+        [pa[0] + (pb[0] - pa[0]) * t, pa[1] + (pb[1] - pa[1]) * t]
+    };
+
+    levels
+        .iter()
+        .copied()
+        .map(|lvl| {
+            let mut segs = Vec::new();
+            for r in 0..(grid.rows - 1) {
+                for c in 0..(grid.cols - 1) {
+                    let v0 = grid.dv_km_s[r * grid.cols + c];
+                    let v1 = grid.dv_km_s[r * grid.cols + (c + 1)];
+                    let v2 = grid.dv_km_s[(r + 1) * grid.cols + (c + 1)];
+                    let v3 = grid.dv_km_s[(r + 1) * grid.cols + c];
+                    let mask = (u8::from(v0 >= lvl))
+                        | (u8::from(v1 >= lvl) << 1)
+                        | (u8::from(v2 >= lvl) << 2)
+                        | (u8::from(v3 >= lvl) << 3);
+                    if mask == 0 || mask == 15 {
+                        continue;
+                    }
+                    let p0 = uv_at(c, r);
+                    let p1 = uv_at(c + 1, r);
+                    let p2 = uv_at(c + 1, r + 1);
+                    let p3 = uv_at(c, r + 1);
+                    let e0 = interp(p0, v0, p1, v1, lvl);
+                    let e1 = interp(p1, v1, p2, v2, lvl);
+                    let e2 = interp(p2, v2, p3, v3, lvl);
+                    let e3 = interp(p3, v3, p0, v0, lvl);
+                    match mask {
+                        1 | 14 => segs.push((e3, e0)),
+                        2 | 13 => segs.push((e0, e1)),
+                        3 | 12 => segs.push((e3, e1)),
+                        4 | 11 => segs.push((e1, e2)),
+                        6 | 9 => segs.push((e0, e2)),
+                        7 | 8 => segs.push((e2, e3)),
+                        5 => {
+                            if 0.25 * (v0 + v1 + v2 + v3) >= lvl {
+                                segs.push((e0, e1));
+                                segs.push((e2, e3));
+                            } else {
+                                segs.push((e3, e0));
+                                segs.push((e1, e2));
+                            }
+                        }
+                        10 => {
+                            if 0.25 * (v0 + v1 + v2 + v3) >= lvl {
+                                segs.push((e3, e0));
+                                segs.push((e1, e2));
+                            } else {
+                                segs.push((e0, e1));
+                                segs.push((e2, e3));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            (lvl, segs)
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -283,10 +444,12 @@ pub struct HelioProbeApp {
     api_status_msg: String,
     json_export_path: String,
     scheduled_window: Option<ScheduledPorkchopWindow>,
+    porkchop_cache: PorkchopCache,
     pending_fetch_rx: Option<mpsc::Receiver<PublicDataFetchResult>>,
     pending_fetch_label: Option<String>,
     mission_log_open: bool,
     show_about_window: bool,
+    focus_catalog_search: bool,
 }
 
 impl HelioProbeApp {
@@ -351,10 +514,12 @@ impl HelioProbeApp {
                     .into(),
             json_export_path: "helioprobe_campaign_save.json".into(),
             scheduled_window: None,
+            porkchop_cache: PorkchopCache::default(),
             pending_fetch_rx: None,
             pending_fetch_label: None,
             mission_log_open: false,
             show_about_window: false,
+            focus_catalog_search: false,
         }
     }
 
@@ -395,10 +560,12 @@ impl HelioProbeApp {
                     .into(),
             json_export_path: "helioprobe_campaign_save.json".into(),
             scheduled_window: None,
+            porkchop_cache: PorkchopCache::default(),
             pending_fetch_rx: None,
             pending_fetch_label: None,
             mission_log_open: false,
             show_about_window: false,
+            focus_catalog_search: false,
         }
     }
 
@@ -510,6 +677,73 @@ impl HelioProbeApp {
         &self.api_status_msg
     }
 
+    pub fn porkchop_cache_stats(&self) -> (u64, u64) {
+        (self.porkchop_cache.hits, self.porkchop_cache.misses)
+    }
+
+    pub fn memoized_porkchop_grid(
+        &mut self,
+        target: &CelestialBody,
+        catalog: &[CelestialBody],
+        cols: usize,
+        rows: usize,
+    ) -> PorkchopGrid {
+        let key = PorkchopCacheKey::from_state(
+            target,
+            self.state.days_since_j2000,
+            &self.state.comet_perihelion_offsets,
+            cols,
+            rows,
+        );
+        if self.porkchop_cache.last_key.as_ref() == Some(&key) {
+            if let Some(ref grid) = self.porkchop_cache.grid {
+                self.porkchop_cache.hits += 1;
+                return grid.clone();
+            }
+        }
+        self.porkchop_cache.misses += 1;
+        let q_days = (key.quantized_days as f64) * 0.25;
+        let grid = compute_porkchop_grid_with_offsets(
+            target,
+            catalog,
+            q_days,
+            &self.state.comet_perihelion_offsets,
+            key.cols,
+            key.rows,
+        );
+        self.porkchop_cache.last_key = Some(key);
+        self.porkchop_cache.grid = Some(grid.clone());
+        grid
+    }
+
+    fn set_camera_mode(&mut self, mode: CameraTrackMode) {
+        self.camera_mode = mode;
+        self.lander_cam_initialized = false;
+        match mode {
+            CameraTrackMode::FreeSolarOverview => {
+                self.camera.target = Vec3d::default();
+                self.desired_cam_distance = 82.0;
+            }
+            CameraTrackMode::LockSelectedBody => {
+                self.desired_cam_distance = 16.0;
+            }
+            CameraTrackMode::OrbitView => {
+                self.desired_cam_distance = 10.5;
+            }
+            CameraTrackMode::RideLatestProbe => {
+                self.desired_cam_distance = 0.36;
+            }
+            CameraTrackMode::LanderBotView => {}
+        }
+    }
+
+    fn reset_solar_overview(&mut self) {
+        self.camera_mode = CameraTrackMode::FreeSolarOverview;
+        self.camera = OrbitCamera3D::default();
+        self.desired_cam_distance = self.camera.distance;
+        self.lander_cam_initialized = false;
+    }
+
     fn spawn_public_fetch<F>(&mut self, ctx: &egui::Context, label: impl Into<String>, work: F)
     where
         F: FnOnce() -> PublicDataFetchResult + Send + 'static,
@@ -614,11 +848,59 @@ impl HelioProbeApp {
             self.show_about_window = !self.show_about_window;
         }
         if !ctx.wants_keyboard_input() {
-            if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
-                self.paused = !self.paused;
-            }
-            if ctx.input(|i| i.key_pressed(egui::Key::F5)) {
-                self.quick_save_slot1();
+            let ctrl_f_pressed = ctx.input(|i| {
+                ((i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::F))
+                    || i.events.iter().any(|ev| {
+                        matches!(
+                            ev,
+                            egui::Event::Key {
+                                key: egui::Key::F,
+                                pressed: true,
+                                modifiers,
+                                ..
+                            } if modifiers.command || modifiers.ctrl
+                        )
+                    })
+            });
+            if ctrl_f_pressed {
+                self.focus_catalog_search = true;
+                ctx.memory_mut(|m| m.request_focus(egui::Id::new("catalog_search_input")));
+            } else {
+                ctx.input(|i| {
+                    let no_mod = !i.modifiers.ctrl && !i.modifiers.command && !i.modifiers.alt;
+                    if no_mod {
+                        if i.key_pressed(egui::Key::Space) {
+                            self.paused = !self.paused;
+                        }
+                        if i.key_pressed(egui::Key::F5) {
+                            self.quick_save_slot1();
+                        }
+                        if i.key_pressed(egui::Key::Num1) {
+                            self.set_camera_mode(CameraTrackMode::FreeSolarOverview);
+                        }
+                        if i.key_pressed(egui::Key::Num2) {
+                            self.set_camera_mode(CameraTrackMode::LockSelectedBody);
+                        }
+                        if i.key_pressed(egui::Key::Num3) {
+                            self.set_camera_mode(CameraTrackMode::OrbitView);
+                        }
+                        if i.key_pressed(egui::Key::Num4) {
+                            self.set_camera_mode(CameraTrackMode::RideLatestProbe);
+                        }
+                        if i.key_pressed(egui::Key::Num5) {
+                            self.set_camera_mode(CameraTrackMode::LanderBotView);
+                        }
+                        if i.key_pressed(egui::Key::O) {
+                            self.show_orbits = !self.show_orbits;
+                        }
+                        if i.key_pressed(egui::Key::L) {
+                            self.show_labels = !self.show_labels;
+                        }
+                        if i.key_pressed(egui::Key::R) {
+                            self.reset_solar_overview();
+                        }
+                    }
+                });
             }
         }
         let now = Instant::now();
@@ -841,15 +1123,18 @@ impl HelioProbeApp {
                         self.camera.distance = self.desired_cam_distance;
                         self.camera.yaw_rad = 0.62;
                         self.lander_cam_initialized = true;
-                    } else {
-                        self.camera.distance = self.desired_cam_distance;
                     }
                 }
             }
         }
-        if self.camera_mode != CameraTrackMode::LanderBotView {
-            self.camera.distance +=
-                (self.desired_cam_distance - self.camera.distance) * (dt * 5.0).min(1.0);
+        let riding_atmo_plunge = self.camera_mode == CameraTrackMode::LanderBotView
+            && self.state.atmospheric_probes.iter().any(|ap| {
+                ap.body_id == self.selected_body_id
+                    && ap.phase != EntryProbePhase::TerminalCrushOrImpact
+            });
+        if !riding_atmo_plunge {
+            let damp = 1.0 - (-dt * 8.0).exp();
+            self.camera.distance += (self.desired_cam_distance - self.camera.distance) * damp;
         }
 
         // Top HUD Bar
@@ -888,10 +1173,16 @@ impl HelioProbeApp {
                     egui::Slider::new(&mut self.ephemeris_days_per_sec, 0.002..=1.0)
                         .logarithmic(true)
                         .text("Orbit Clock (d/s)"),
+                )
+                .on_hover_text(
+                    "Ephemeris simulation rate in Julian days per real-time second (0.002–1.0 d/s). Advances planetary, lunar, L2 halo, and cometary Keplerian motion.",
                 );
                 ui.add(
                     egui::Slider::new(&mut self.transit_warp, 0.5..=10.0)
                         .text("Probe Transit Warp"),
+                )
+                .on_hover_text(
+                    "Visual animation speed multiplier (0.5x–10.0x) for spacecraft transfers, atmospheric entry plunges, and sample-return capsules. Physical Δv and flight-day calculations are unaffected.",
                 );
                 ui.checkbox(&mut self.show_orbits, "3D Orbits");
                 ui.checkbox(&mut self.show_labels, "Labels");
@@ -908,12 +1199,16 @@ impl HelioProbeApp {
             .show(ctx, |ui| {
                 ui.heading("1. Celestial Target Catalog");
                 ui.horizontal(|ui| {
-                    ui.add(
+                    let search_resp = ui.add(
                         egui::TextEdit::singleline(&mut self.catalog_search)
                             .id(egui::Id::new("catalog_search_input"))
                             .desired_width(145.0)
-                            .hint_text("Search targets..."),
+                            .hint_text("Search targets... (Ctrl+F)"),
                     );
+                    if self.focus_catalog_search {
+                        search_resp.request_focus();
+                        self.focus_catalog_search = false;
+                    }
                     if !self.catalog_search.is_empty() && ui.button("Clear").clicked() {
                         self.catalog_search.clear();
                     }
@@ -1028,6 +1323,14 @@ impl HelioProbeApp {
                             xfer.capture_orbit_vel_km_s,
                             xfer.capture_altitude_km
                         ));
+                        if target.distance_ly > 0.0 {
+                            ui.small(format!(
+                                "Relativistic Transit: {:.1} yr (Earth) | Proper Ship Time: {:.1} yr (γ = {:.3})",
+                                xfer.physical_flight_days / 365.25,
+                                xfer.proper_flight_days / 365.25,
+                                xfer.lorentz_gamma
+                            ));
+                        }
                     }
                     if let Some(win) = self.scheduled_window.clone() {
                         if win.target_id == target.id {
@@ -1111,9 +1414,7 @@ impl HelioProbeApp {
                         )
                         .clicked()
                     {
-                        self.camera_mode = CameraTrackMode::FreeSolarOverview;
-                        self.camera.target = Vec3d::default();
-                        self.desired_cam_distance = 82.0;
+                        self.set_camera_mode(CameraTrackMode::FreeSolarOverview);
                     }
                     if ui
                         .selectable_label(
@@ -1122,8 +1423,7 @@ impl HelioProbeApp {
                         )
                         .clicked()
                     {
-                        self.camera_mode = CameraTrackMode::LockSelectedBody;
-                        self.desired_cam_distance = 16.0;
+                        self.set_camera_mode(CameraTrackMode::LockSelectedBody);
                     }
                     if ui
                         .selectable_label(
@@ -1132,8 +1432,7 @@ impl HelioProbeApp {
                         )
                         .clicked()
                     {
-                        self.camera_mode = CameraTrackMode::OrbitView;
-                        self.desired_cam_distance = 10.5;
+                        self.set_camera_mode(CameraTrackMode::OrbitView);
                     }
                     if ui
                         .selectable_label(
@@ -1142,8 +1441,7 @@ impl HelioProbeApp {
                         )
                         .clicked()
                     {
-                        self.camera_mode = CameraTrackMode::RideLatestProbe;
-                        self.desired_cam_distance = 0.36;
+                        self.set_camera_mode(CameraTrackMode::RideLatestProbe);
                     }
                     if ui
                         .selectable_label(
@@ -1152,8 +1450,7 @@ impl HelioProbeApp {
                         )
                         .clicked()
                     {
-                        self.camera_mode = CameraTrackMode::LanderBotView;
-                        self.lander_cam_initialized = false;
+                        self.set_camera_mode(CameraTrackMode::LanderBotView);
                     }
                 });
 
@@ -1386,8 +1683,13 @@ impl HelioProbeApp {
 
                     RightTab::L2AndComets => {
                         egui::ScrollArea::vertical().show(ui, |ui| {
+                            let l2_dyn = compute_sun_earth_l2_dynamics();
                             ui.heading("Sun-Earth L2 Space Telescopes (~1.5M km)");
                             ui.label("Station space observatories in anti-sunward Lissajous halo orbits behind Earth & Moon.");
+                            ui.small(format!(
+                                "Hill r_L2 = {:.0} km | CR3BP Halo Periods: T_xy = {:.1} d, T_z = {:.1} d",
+                                l2_dyn.hill_radius_km, l2_dyn.period_xy_days, l2_dyn.period_z_days
+                            ));
                             if ui.button("Focus Camera on Sun-Earth L2 Halo").clicked() {
                                 self.selected_body_id = "sun_earth_l2".into();
                                 self.camera_mode = CameraTrackMode::OrbitView;
@@ -1444,8 +1746,8 @@ impl HelioProbeApp {
                                         );
                                     });
                                     ui.label(format!(
-                                        "e = {:.4} | i = {:.1}° | Outgassing Q ~ {:.2e} mol/s | Activity {:.2}",
-                                        comet.eccentricity, comet.inclination_deg, tail.gas_production_q_s, tail.activity
+                                        "e = {:.4} | i = {:.1}° | Ion Aberration {:.2}° | Q ~ {:.2e} mol/s | Activity {:.2}",
+                                        comet.eccentricity, comet.inclination_deg, tail.ion_aberration_deg, tail.gas_production_q_s, tail.activity
                                     ));
                                     ui.horizontal_wrapped(|ui| {
                                         if ui.button("Track Comet").clicked() {
@@ -1505,14 +1807,7 @@ impl HelioProbeApp {
                             catalog.iter().find(|b| b.id == self.selected_body_id).cloned()
                         {
                             ui.heading(format!("Porkchop & Gravity-Assist Lab — {}", target.name));
-                            let grid = compute_porkchop_grid_with_offsets(
-                                &target,
-                                &catalog,
-                                self.state.days_since_j2000,
-                                &self.state.comet_perihelion_offsets,
-                                28,
-                                20,
-                            );
+                            let grid = self.memoized_porkchop_grid(&target, &catalog, 28, 20);
 
                             ui.label(format!(
                                 "Synodic Period: {:.1} d | Current Phase Offset: {:+.1}°",
@@ -1545,13 +1840,30 @@ impl HelioProbeApp {
                             }
 
                             ui.add_space(4.0);
-                            let plot_w = ui.available_width().max(240.0);
-                            let plot_h = 175.0;
-                            let (p_rect, p_resp) = ui.allocate_exact_size(
-                                egui::vec2(plot_w, plot_h),
+                            let outer_w = ui.available_width().max(260.0);
+                            let outer_h = 204.0_f32;
+                            let (outer_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(outer_w, outer_h),
+                                egui::Sense::hover(),
+                            );
+                            let left_pad = 44.0_f32;
+                            let bottom_pad = 24.0_f32;
+                            let top_pad = 6.0_f32;
+                            let right_pad = 8.0_f32;
+                            let p_rect = egui::Rect::from_min_max(
+                                egui::pos2(outer_rect.left() + left_pad, outer_rect.top() + top_pad),
+                                egui::pos2(
+                                    (outer_rect.right() - right_pad).max(outer_rect.left() + left_pad + 64.0),
+                                    (outer_rect.bottom() - bottom_pad).max(outer_rect.top() + top_pad + 64.0),
+                                ),
+                            );
+                            let p_resp = ui.interact(
+                                p_rect,
+                                ui.id().with("porkchop_plot_area"),
                                 egui::Sense::click_and_drag(),
                             );
                             let painter = ui.painter_at(p_rect);
+                            let axis_painter = ui.painter_at(outer_rect);
                             let cell_w = p_rect.width() / (grid.cols as f32);
                             let cell_h = p_rect.height() / (grid.rows as f32);
                             let span = (grid.max_dv_km_s - grid.min_dv_km_s).max(0.05);
@@ -1571,6 +1883,37 @@ impl HelioProbeApp {
                                     painter.rect_filled(cell_rect, 0.0, porkchop_colormap(norm));
                                 }
                             }
+
+                            // Iso-delta-v contours (marching squares)
+                            let contour_levels =
+                                porkchop_contour_levels(grid.min_dv_km_s, grid.max_dv_km_s);
+                            let contour_sets =
+                                extract_porkchop_iso_contours(&grid, &contour_levels);
+                            for (idx, (_lvl, segs)) in contour_sets.iter().enumerate() {
+                                let stroke = if idx == 0 {
+                                    egui::Stroke::new(
+                                        1.3_f32,
+                                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200),
+                                    )
+                                } else {
+                                    egui::Stroke::new(
+                                        0.9_f32,
+                                        egui::Color32::from_rgba_unmultiplied(230, 240, 255, 120),
+                                    )
+                                };
+                                for &(a, b) in segs {
+                                    let pa = egui::pos2(
+                                        p_rect.left() + a[0] * p_rect.width(),
+                                        p_rect.top() + a[1] * p_rect.height(),
+                                    );
+                                    let pb = egui::pos2(
+                                        p_rect.left() + b[0] * p_rect.width(),
+                                        p_rect.top() + b[1] * p_rect.height(),
+                                    );
+                                    painter.line_segment([pa, pb], stroke);
+                                }
+                            }
+
                             let bx =
                                 p_rect.left() + (grid.best_col as f32 + 0.5) * cell_w;
                             let by = p_rect.top()
@@ -1662,18 +2005,71 @@ impl HelioProbeApp {
 
                             painter.rect_stroke(
                                 p_rect,
-                                2.0,
-                                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(70, 95, 130)),
+                                0.0,
+                                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(80, 105, 145)),
                                 egui::StrokeKind::Inside,
                             );
 
+                            // X & Y numeric ticks
+                            let dep_start = grid.dep_offsets_days.first().copied().unwrap_or(0.0);
                             let dep_end = grid.dep_offsets_days.last().copied().unwrap_or(0.0);
                             let tof_min = grid.tof_days.first().copied().unwrap_or(0.0);
                             let tof_max = grid.tof_days.last().copied().unwrap_or(0.0);
+                            let tick_stroke =
+                                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(135, 155, 185));
+                            let tick_color = egui::Color32::from_rgb(185, 200, 225);
+                            let tick_font = egui::FontId::proportional(10.0);
+
+                            for tx_i in 0..=4 {
+                                let frac = tx_i as f32 / 4.0;
+                                let x = p_rect.left() + frac * p_rect.width();
+                                axis_painter.line_segment(
+                                    [egui::pos2(x, p_rect.bottom()), egui::pos2(x, p_rect.bottom() + 4.0)],
+                                    tick_stroke,
+                                );
+                                let val = dep_start + (dep_end - dep_start) * frac as f64;
+                                let align = if tx_i == 0 {
+                                    egui::Align2::LEFT_TOP
+                                } else if tx_i == 4 {
+                                    egui::Align2::RIGHT_TOP
+                                } else {
+                                    egui::Align2::CENTER_TOP
+                                };
+                                axis_painter.text(
+                                    egui::pos2(x, p_rect.bottom() + 5.0),
+                                    align,
+                                    format!("+{val:.0}d"),
+                                    tick_font.clone(),
+                                    tick_color,
+                                );
+                            }
+                            for ty_i in 0..=3 {
+                                let frac = ty_i as f32 / 3.0;
+                                let y = p_rect.bottom() - frac * p_rect.height();
+                                axis_painter.line_segment(
+                                    [egui::pos2(p_rect.left() - 4.0, y), egui::pos2(p_rect.left(), y)],
+                                    tick_stroke,
+                                );
+                                let val = tof_min + (tof_max - tof_min) * frac as f64;
+                                let align = if ty_i == 0 {
+                                    egui::Align2::RIGHT_BOTTOM
+                                } else if ty_i == 3 {
+                                    egui::Align2::RIGHT_TOP
+                                } else {
+                                    egui::Align2::RIGHT_CENTER
+                                };
+                                axis_painter.text(
+                                    egui::pos2(p_rect.left() - 6.0, y),
+                                    align,
+                                    format!("{val:.0}d"),
+                                    tick_font.clone(),
+                                    tick_color,
+                                );
+                            }
+
                             ui.small(format!(
-                                "X: Dep +0..+{dep_end:.0} d  |  Y: TOF {tof_min:.0}..{tof_max:.0} d  |  dV {min_dv:.1}..{max_dv:.1} km/s",
-                                min_dv = grid.min_dv_km_s,
-                                max_dv = grid.max_dv_km_s
+                                "X: Dep +{dep_start:.0}..+{dep_end:.0} d  |  Y: TOF {tof_min:.0}..{tof_max:.0} d  |  Contours: {} levels",
+                                contour_levels.len()
                             ));
                             ui.horizontal(|ui| {
                                 ui.small("dV Scale:");
@@ -2473,32 +2869,77 @@ impl HelioProbeApp {
 
         if self.show_about_window {
             let mut open = self.show_about_window;
-            egui::Window::new("About HelioProbe")
+            egui::Window::new("About HelioProbe & Mission Reference")
                 .open(&mut open)
                 .collapsible(false)
-                .resizable(false)
+                .resizable(true)
+                .default_width(530.0)
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
                 .show(ctx, |ui| {
-                    ui.heading("HelioProbe v2.3.0");
-                    ui.label("Copyright CRV Science Network");
-                    ui.label("License: GNU General Public License v3.0 or later (GPL-3.0-or-later)");
-                    ui.separator();
-                    ui.label("Native Rust 3D Space Probe, Sun-Earth L2 Space Telescopes,");
-                    ui.label("3D Universal-Variable Lambert Porkchop & Gravity-Assist Lab,");
-                    ui.label("Dynamic Comets, and Ocean-World Cryobot Simulator.");
-                    ui.add_space(6.0);
-                    ui.hyperlink_to(
-                        "CRV Science Network Website (https://crvscience.com)",
-                        "https://crvscience.com",
-                    );
-                    ui.hyperlink_to(
-                        "CRV Science Public Apps (https://crvscience.com/apps)",
-                        "https://crvscience.com/apps",
-                    );
-                    ui.add_space(6.0);
-                    if ui.button("Close").clicked() {
-                        self.show_about_window = false;
-                    }
+                    egui::ScrollArea::vertical().max_height(480.0).show(ui, |ui| {
+                        ui.heading("HelioProbe v2.3.0");
+                        ui.label("Copyright CRV Science Network");
+                        ui.label("License: GNU General Public License v3.0 or later (GPL-3.0-or-later)");
+                        ui.separator();
+                        ui.label(
+                            "Native safe-Rust 3D space probe, Sun-Earth L2 space telescopes, \
+                             universal-variable Lambert Porkchop & gravity-assist lab, dynamic \
+                             comets, and ocean-world cryobot simulator.",
+                        );
+                        ui.add_space(6.0);
+
+                        ui.strong("Interactive Controls & Keyboard Shortcuts");
+                        egui::Grid::new("about_controls_grid")
+                            .striped(true)
+                            .spacing([14.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.strong("1 – 5");
+                                ui.label("Switch camera (1 Solar, 2 Target, 3 Orbit, 4 Ride Probe, 5 Lander/Bot POV)");
+                                ui.end_row();
+                                ui.strong("R");
+                                ui.label("Reset camera to default Solar Overview");
+                                ui.end_row();
+                                ui.strong("O / L");
+                                ui.label("Toggle 3D orbital ribbons / body labels");
+                                ui.end_row();
+                                ui.strong("Ctrl+F");
+                                ui.label("Focus Celestial Target Catalog search box");
+                                ui.end_row();
+                                ui.strong("Space");
+                                ui.label("Pause / resume ephemeris & probe simulation");
+                                ui.end_row();
+                                ui.strong("F5 / F1 / Esc");
+                                ui.label("Quick-save Slot 1 / Toggle Help modal / Close modal or log");
+                                ui.end_row();
+                                ui.strong("Drag / Scroll / Click");
+                                ui.label("Orbit 3D view / Smooth damped zoom / Select body");
+                                ui.end_row();
+                            });
+
+                        ui.add_space(6.0);
+                        ui.strong("Mission Quick-Start");
+                        ui.label("1. Search & pick a body in the Catalog (Ctrl+F), or import live NASA/SIMBAD records in Public Data.");
+                        ui.label("2. Open the Windows tab to inspect iso-Δv Porkchop basins, schedule an epoch, or arm a Gravity Assist.");
+                        ui.label("3. Choose a propulsion bus and Launch Probe from Earth; follow transit (4) into orbit capture (3).");
+                        ui.label("4. Run 5-band Scanner sweeps (or deploy JWST/Roman at Sun-Earth L2 for remote scans), drop Landers/Cryobots/Entry Probes (5), and invest SP in Tech Lab.");
+
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.hyperlink_to(
+                                "CRV Science Network (https://crvscience.com)",
+                                "https://crvscience.com",
+                            );
+                            ui.separator();
+                            ui.hyperlink_to(
+                                "Public Apps (https://crvscience.com/apps)",
+                                "https://crvscience.com/apps",
+                            );
+                        });
+                        ui.add_space(6.0);
+                        if ui.button("Close (Esc)").clicked() {
+                            self.show_about_window = false;
+                        }
+                    });
                 });
             if !open {
                 self.show_about_window = false;
@@ -2539,7 +2980,6 @@ impl HelioProbeApp {
                         let factor = (1.0 - (scroll as f64) * 0.0022).clamp(0.82, 1.22);
                         self.desired_cam_distance =
                             (self.desired_cam_distance * factor).clamp(0.015, 260.0);
-                        self.camera.distance = self.desired_cam_distance;
                     }
                 }
 
@@ -3207,5 +3647,217 @@ mod tests {
             msg.contains("• Achievement: OSIRIS Sample Legacy (+200 SP)"),
             "Expected Bennu 5-band sweep achievement toast, got: {msg}"
         );
+    }
+
+    fn run_key_frame_mods(
+        ctx: &egui::Context,
+        app: &mut HelioProbeApp,
+        key: egui::Key,
+        modifiers: egui::Modifiers,
+    ) {
+        let mut raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 900.0),
+            )),
+            modifiers,
+            ..Default::default()
+        };
+        raw.events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        });
+        let _ = ctx.run(raw, |ctx| {
+            app.ui_step(ctx);
+        });
+    }
+
+    #[test]
+    fn headless_camera_hotkeys_orbits_labels_reset_and_ctrl_f_focus() {
+        let ctx = egui::Context::default();
+        let mut app = HelioProbeApp::new_headless(PathBuf::from("test_hotkeys_2.db"));
+        run_key_frame(&ctx, &mut app, None);
+
+        // 1..5 camera track modes
+        run_key_frame(&ctx, &mut app, Some(egui::Key::Num2));
+        assert_eq!(app.camera_mode, CameraTrackMode::LockSelectedBody);
+        run_key_frame(&ctx, &mut app, Some(egui::Key::Num3));
+        assert_eq!(app.camera_mode, CameraTrackMode::OrbitView);
+        run_key_frame(&ctx, &mut app, Some(egui::Key::Num4));
+        assert_eq!(app.camera_mode, CameraTrackMode::RideLatestProbe);
+        run_key_frame(&ctx, &mut app, Some(egui::Key::Num5));
+        assert_eq!(app.camera_mode, CameraTrackMode::LanderBotView);
+        run_key_frame(&ctx, &mut app, Some(egui::Key::Num1));
+        assert_eq!(app.camera_mode, CameraTrackMode::FreeSolarOverview);
+
+        // O / L toggle orbits & labels
+        assert!(app.show_orbits && app.show_labels);
+        run_key_frame(&ctx, &mut app, Some(egui::Key::O));
+        assert!(!app.show_orbits);
+        run_key_frame(&ctx, &mut app, Some(egui::Key::L));
+        assert!(!app.show_labels);
+
+        // R resets Solar Overview camera
+        app.camera_mode = CameraTrackMode::OrbitView;
+        app.camera.yaw_rad = 2.1;
+        app.camera.pitch_rad = -0.4;
+        app.desired_cam_distance = 12.0;
+        run_key_frame(&ctx, &mut app, Some(egui::Key::R));
+        assert_eq!(app.camera_mode, CameraTrackMode::FreeSolarOverview);
+        assert!((app.camera.yaw_rad - 0.65).abs() < 1e-9);
+        assert!((app.camera.pitch_rad - 0.46).abs() < 1e-9);
+        assert!((app.desired_cam_distance - 78.0).abs() < 1e-9);
+
+        // Ctrl+F grabs focus onto catalog_search_input TextEdit cleanly
+        assert!(!ctx.wants_keyboard_input());
+        run_key_frame_mods(&ctx, &mut app, egui::Key::F, egui::Modifiers::CTRL);
+        // Step one UI frame after request_focus so egui promotes requested focus into active TextEdit focus
+        run_key_frame(&ctx, &mut app, None);
+        assert!(
+            ctx.wants_keyboard_input(),
+            "Ctrl+F must grant keyboard focus to catalog_search_input"
+        );
+        assert!(ctx.memory(|m| m.has_focus(egui::Id::new("catalog_search_input"))));
+
+        // While catalog search has focus, 1-5 / O / L / R / Space must NOT fire
+        let prev_orbits = app.show_orbits;
+        let prev_labels = app.show_labels;
+        run_key_frame(&ctx, &mut app, Some(egui::Key::Num3));
+        run_key_frame(&ctx, &mut app, Some(egui::Key::O));
+        run_key_frame(&ctx, &mut app, Some(egui::Key::L));
+        run_key_frame(&ctx, &mut app, Some(egui::Key::R));
+        assert_eq!(app.camera_mode, CameraTrackMode::FreeSolarOverview);
+        assert_eq!(app.show_orbits, prev_orbits);
+        assert_eq!(app.show_labels, prev_labels);
+    }
+
+    #[test]
+    fn porkchop_cache_memoization_and_invalidation() {
+        let mut app = HelioProbeApp::new_headless(PathBuf::from("test_porkchop_cache.db"));
+        let catalog = app.full_catalog();
+        let mars = catalog.iter().find(|b| b.id == "mars").expect("mars").clone();
+        let saturn = catalog.iter().find(|b| b.id == "saturn").expect("saturn").clone();
+        let halley = catalog
+            .iter()
+            .find(|b| b.id == "halley_1p")
+            .expect("halley_1p")
+            .clone();
+
+        app.state.days_since_j2000 = 9814.50;
+        let g1 = app.memoized_porkchop_grid(&mars, &catalog, 28, 20);
+        assert_eq!(app.porkchop_cache_stats(), (0, 1));
+
+        // Same target and same 0.25d quantum hits cache
+        app.state.days_since_j2000 = 9814.55;
+        let g2 = app.memoized_porkchop_grid(&mars, &catalog, 28, 20);
+        assert_eq!(app.porkchop_cache_stats(), (1, 1));
+        assert_eq!(g1.dv_km_s, g2.dv_km_s);
+
+        // Stepping across 0.25d quantum boundary invalidates cache
+        app.state.days_since_j2000 = 9814.80;
+        let _ = app.memoized_porkchop_grid(&mars, &catalog, 28, 20);
+        assert_eq!(app.porkchop_cache_stats(), (1, 2));
+
+        // Changing target invalidates cache
+        let _ = app.memoized_porkchop_grid(&saturn, &catalog, 28, 20);
+        assert_eq!(app.porkchop_cache_stats(), (1, 3));
+
+        // Changing grid resolution invalidates cache
+        let _ = app.memoized_porkchop_grid(&saturn, &catalog, 24, 16);
+        assert_eq!(app.porkchop_cache_stats(), (1, 4));
+
+        // Changing comet perihelion offset invalidates cache
+        let g_halley_before = app.memoized_porkchop_grid(&halley, &catalog, 28, 20);
+        assert_eq!(app.porkchop_cache_stats(), (1, 5));
+        app.state.warp_comet_to_perihelion(&halley).expect("warp halley");
+        let g_halley_after = app.memoized_porkchop_grid(&halley, &catalog, 28, 20);
+        assert_eq!(app.porkchop_cache_stats(), (1, 6));
+        assert!((g_halley_before.min_dv_km_s - g_halley_after.min_dv_km_s).abs() > 1e-4);
+    }
+
+    #[test]
+    fn scroll_zoom_damps_exponentially_and_porkchop_contours_extract_cleanly() {
+        let ctx = egui::Context::default();
+        let mut app = HelioProbeApp::new_headless(PathBuf::from("test_zoom_damp.db"));
+        app.desired_cam_distance = 78.0;
+        app.camera.distance = 78.0;
+        run_key_frame(&ctx, &mut app, None);
+
+        // Hover central viewport and scroll inward
+        let mut t = 0.1_f64;
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 900.0),
+            )),
+            time: Some(t),
+            events: vec![
+                egui::Event::PointerMoved(egui::pos2(680.0, 460.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, 80.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        };
+        app.last_frame = Instant::now() - std::time::Duration::from_millis(16);
+        let _ = ctx.run(raw, |ctx| {
+            app.ui_step(ctx);
+        });
+        assert!(
+            app.desired_cam_distance < 77.5,
+            "Scroll must update desired_cam_distance, got {}",
+            app.desired_cam_distance
+        );
+        assert!(
+            (app.camera.distance - app.desired_cam_distance).abs() > 0.5,
+            "Scroll must not hard-snap camera.distance to desired_cam_distance on the first frame"
+        );
+        // Drain egui's smooth_scroll_delta decay by advancing input time, then verify exponential convergence
+        for _ in 0..18 {
+            t += 0.05;
+            let settle_raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1400.0, 900.0),
+                )),
+                time: Some(t),
+                ..Default::default()
+            };
+            app.last_frame = Instant::now() - std::time::Duration::from_millis(32);
+            let _ = ctx.run(settle_raw, |ctx| {
+                app.ui_step(ctx);
+            });
+        }
+        let gap_after = (app.camera.distance - app.desired_cam_distance).abs();
+        assert!(
+            gap_after < 0.25,
+            "Expected exponential damping convergence toward desired_cam_distance, remaining gap={gap_after}"
+        );
+
+        // Verify Porkchop Viridis colormap & marching-squares iso-contours
+        let catalog = app.full_catalog();
+        let mars = catalog.iter().find(|b| b.id == "mars").expect("mars").clone();
+        let grid = app.memoized_porkchop_grid(&mars, &catalog, 28, 20);
+        let levels = porkchop_contour_levels(grid.min_dv_km_s, grid.max_dv_km_s);
+        assert!(!levels.is_empty());
+        let contours = extract_porkchop_iso_contours(&grid, &levels);
+        assert_eq!(contours.len(), levels.len());
+        let total_segs: usize = contours.iter().map(|(_, s)| s.len()).sum();
+        assert!(total_segs > 20, "Expected iso-dV contour segments, got {total_segs}");
+        for (_, segs) in &contours {
+            for &(a, b) in segs {
+                assert!((0.0..=1.0).contains(&a[0]) && (0.0..=1.0).contains(&a[1]));
+                assert!((0.0..=1.0).contains(&b[0]) && (0.0..=1.0).contains(&b[1]));
+            }
+        }
+        let c0 = porkchop_colormap(0.0);
+        let c1 = porkchop_colormap(1.0);
+        assert_eq!(c0, egui::Color32::from_rgb(68, 1, 84));
+        assert_eq!(c1, egui::Color32::from_rgb(253, 231, 37));
     }
 }
