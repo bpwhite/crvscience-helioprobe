@@ -41,6 +41,7 @@ All hotkeys except `F1` and `Esc` are guarded by `!ctx.wants_keyboard_input()` s
 | **`R`** | Reset camera to default Solar Overview |
 | **`O` / `L`** | Toggle 3D orbital ribbons / de-overlapped body labels |
 | **`Ctrl+F`** (`Cmd+F`) | Focus Celestial Target Catalog search box |
+| **`Ctrl+K`** (`Cmd+K`) | Open fuzzy Quick-Jump Mission & Transfer Palette (focus bodies/L2/probes, time warp presets, transfer planner, and exports) |
 | **`Space`** | Pause / Resume ephemeris and probe simulation clock |
 | **`F5`** | Quick Save campaign to SQLite Slot 1 |
 | **`F1` / `Esc`** | Toggle About & Controls Reference modal / Close modal or Mission Log |
@@ -58,6 +59,7 @@ All hotkeys except `F1` and `Esc` are guarded by `!ctx.wants_keyboard_input()` s
 | `sync-exoplanet <NAME>` | `<name>` | Query live NASA Exoplanet Archive TAP service and output JSON |
 | `sync-simbad <IDENTIFIER>` | `<identifier>` | Query live CDS SIMBAD TAP service and output JSON |
 | `porkchop [TARGET_ID]` | `saturn` | Print synodic period, Lambert Porkchop optimum, and Gravity-Assist options |
+| `budget` | `[--targets <IDS>] [--format <table\|json\|csv>] [--output <PATH>]` | Compare multi-target Hohmann and Sun–Earth L2 transfer $\Delta v$, $C_3$, and time-of-flight mission budgets (also interactive in the `Windows` tab) |
 | `slots` | — | List saved campaigns in `--db` |
 
 ---
@@ -83,7 +85,7 @@ All hotkeys except `F1` and `Esc` are guarded by `!ctx.wants_keyboard_input()` s
 
 Observed outputs from `cargo test --all-targets` and CLI runs on this codebase:
 
-- **Test Suite (`cargo test --all-targets`)**: **27 passed, 0 failed** (`5` unit tests in `src/lib.rs`, `22` integration tests in `tests/simulation_tests.rs`, `0` compiler warnings).
+- **Test Suite (`cargo test --all-targets`)**: **30 passed, 0 failed** (`7` library unit tests in `src/lib.rs`, `1` CLI parser test in `src/main.rs`, `22` integration tests in `tests/simulation_tests.rs`, `0` compiler warnings).
 - **Lambert Round-Trip & Hyperbolic Propagation**: 3D Lambert transfer to inclined `1 Ceres` (`dt = 260 d`) round-trips within `< 5.0 km`; full `20 x 20` Porkchop grid across 9 diverse bodies produces `0` NaNs with `< 10.0 km` position / `< 1e-2 km/s` velocity error; hyperbolic `40 d` and `1200 d` propagations agree with 8,000–12,000-step RK4 within `< 1.0 km`.
 - **Halley Ion-Tail Aberration**: `compute_comet_tail_state` for `1P/Halley` (`e = 0.9672`) agrees with `atan2(v_perp, v_sw - v_r)` within `< 1e-6 deg` (target threshold `< 1.0 deg`) across perihelion, inbound, outbound, and outer anomalies.
 - **Launcher vs. Porkchop Capture Reconciliation (`porkchop saturn` / `porkchop jupiter`)**:

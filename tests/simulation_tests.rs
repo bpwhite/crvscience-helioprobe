@@ -445,7 +445,8 @@ fn r1_contracts_icon_profile_ci_and_json_error_surfacing() {
     assert!(cargo_toml.contains("rfd = \"0.15\""));
     assert!(!cargo_toml.contains("apps/private"));
     assert!(manifest_dir.join("assets/helioprobe.ico").is_file());
-    assert!(manifest_dir.join(".github/workflows/ci.yml").is_file());
+    assert!(manifest_dir.join("CITATION.cff").is_file());
+    assert!(!manifest_dir.join(".github/workflows/ci.yml").exists());
 
     let state = CampaignState::default();
     let json_path = std::env::temp_dir().join("helioprobe_r1_roundtrip_test.json");

@@ -22,11 +22,13 @@
 //!   radial/orbital feasibility checks, and positive `delta_v` savings filtering.
 
 use crate::catalog::{BodyCategory, CelestialBody};
+use crate::l2_comets::compute_sun_earth_l2_dynamics;
 use crate::physics::{
     compute_capture_orbit, compute_transfer_from_earth, kepler_position_au,
     kepler_state_ecliptic_km, stumpff_c_s, Vec3d, AU_KM, EARTH_RADIUS_KM, GM_EARTH_KM3_S2,
     GM_SUN_KM3_S2, LEO_ALTITUDE_KM,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::f64::consts::{PI, TAU};
 
@@ -699,4 +701,230 @@ pub fn compute_gravity_assist(
         periapsis_alt_km: peri_alt,
         total_flight_days: flight_days,
     })
+}
+
+pub const DEFAULT_MISSION_BUDGET_TARGETS: &[&str] = &[
+    "sun_earth_l2",
+    "venus",
+    "mars",
+    "ceres",
+    "jupiter",
+    "europa",
+    "saturn",
+    "titan",
+    "uranus",
+    "neptune",
+];
+
+/// Comparative mission delta-v, C3, time-of-flight, and gravity-assist savings entry
+/// for a single Solar System or Sun–Earth L2 destination.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionBudgetTargetRow {
+    pub target_id: String,
+    pub target_name: String,
+    pub category: String,
+    pub regime: String,
+    pub semi_major_axis_au: f64,
+    pub transfer_dv_km_s: f64,
+    pub c3_km2_s2: f64,
+    pub time_of_flight_days: f64,
+    pub capture_orbit_vel_km_s: f64,
+    pub best_assist_body: Option<String>,
+    pub assisted_dv_km_s: Option<f64>,
+    pub dv_saved_km_s: f64,
+    pub assisted_flight_days: Option<f64>,
+}
+
+/// Multi-target Hohmann / Sun–Earth L2 transfer delta-v & time-of-flight mission budget comparator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionTransferBudgetReport {
+    pub l2_distance_km: f64,
+    pub l2_halo_period_xy_days: f64,
+    pub l2_halo_period_z_days: f64,
+    pub rows: Vec<MissionBudgetTargetRow>,
+}
+
+/// Computes a multi-target Hohmann + Sun–Earth L2 halo transfer delta-v & time-of-flight
+/// mission budget table across `target_ids` (defaulting to `DEFAULT_MISSION_BUDGET_TARGETS` if empty).
+pub fn compute_multi_target_transfer_budget(
+    target_ids: &[&str],
+    catalog: &[CelestialBody],
+) -> MissionTransferBudgetReport {
+    let ids: &[&str] = if target_ids.is_empty() {
+        DEFAULT_MISSION_BUDGET_TARGETS
+    } else {
+        target_ids
+    };
+    let l2_dyn = compute_sun_earth_l2_dynamics();
+
+    let mut rows = Vec::new();
+    for &id in ids {
+        let key = id.trim().to_ascii_lowercase();
+        let Some(target) = catalog.iter().find(|b| b.id == key) else {
+            continue;
+        };
+        let sol = compute_transfer_from_earth(target, catalog, 0.05);
+        let regime = if target.category == BodyCategory::LagrangePoint {
+            "Sun-Earth L2 Halo"
+        } else if target.distance_ly > 0.0 {
+            "Relativistic Interstellar"
+        } else {
+            "Heliocentric Hohmann"
+        };
+
+        let mut best_assist: Option<GravityAssistSolution> = None;
+        for aid in ASSIST_CANDIDATE_IDS {
+            if let Some(ab) = catalog.iter().find(|b| b.id == aid) {
+                if let Some(ga) = compute_gravity_assist(ab, target, catalog) {
+                    if best_assist
+                        .as_ref()
+                        .map_or(true, |prev| ga.dv_saved_km_s > prev.dv_saved_km_s)
+                    {
+                        best_assist = Some(ga);
+                    }
+                }
+            }
+        }
+
+        let (best_assist_body, assisted_dv_km_s, dv_saved_km_s, assisted_flight_days) =
+            match best_assist {
+                Some(ga) => (
+                    Some(ga.assist_name),
+                    Some(ga.assisted_dv_km_s),
+                    ga.dv_saved_km_s,
+                    Some(ga.total_flight_days),
+                ),
+                None => (None, None, 0.0, None),
+            };
+
+        rows.push(MissionBudgetTargetRow {
+            target_id: target.id.clone(),
+            target_name: target.name.clone(),
+            category: format!("{:?}", target.category),
+            regime: regime.to_string(),
+            semi_major_axis_au: target.semi_major_axis_au,
+            transfer_dv_km_s: sol.total_delta_v_km_s,
+            c3_km2_s2: sol.c3_km2_s2,
+            time_of_flight_days: sol.physical_flight_days,
+            capture_orbit_vel_km_s: sol.capture_orbit_vel_km_s,
+            best_assist_body,
+            assisted_dv_km_s,
+            dv_saved_km_s,
+            assisted_flight_days,
+        });
+    }
+
+    MissionTransferBudgetReport {
+        l2_distance_km: l2_dyn.l2_distance_km,
+        l2_halo_period_xy_days: l2_dyn.period_xy_days,
+        l2_halo_period_z_days: l2_dyn.period_z_days,
+        rows,
+    }
+}
+
+impl MissionTransferBudgetReport {
+    pub fn to_csv(&self) -> String {
+        let mut out = String::from(
+            "target_id,target_name,category,regime,semi_major_axis_au,transfer_dv_km_s,c3_km2_s2,time_of_flight_days,capture_orbit_vel_km_s,best_assist_body,assisted_dv_km_s,dv_saved_km_s,assisted_flight_days\n",
+        );
+        for r in &self.rows {
+            out.push_str(&format!(
+                "{},\"{}\",{},\"{}\",{:.4},{:.3},{:.2},{:.1},{:.3},{},{},{:.3},{}\n",
+                r.target_id,
+                r.target_name,
+                r.category,
+                r.regime,
+                r.semi_major_axis_au,
+                r.transfer_dv_km_s,
+                r.c3_km2_s2,
+                r.time_of_flight_days,
+                r.capture_orbit_vel_km_s,
+                r.best_assist_body.as_deref().unwrap_or("none"),
+                r.assisted_dv_km_s
+                    .map(|v| format!("{v:.3}"))
+                    .unwrap_or_else(|| "na".into()),
+                r.dv_saved_km_s,
+                r.assisted_flight_days
+                    .map(|v| format!("{v:.1}"))
+                    .unwrap_or_else(|| "na".into()),
+            ));
+        }
+        out
+    }
+
+    pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    pub fn format_table(&self) -> String {
+        let mut out = format!(
+            "=== HelioProbe Multi-Target Hohmann & Sun-Earth L2 Mission Budget (L2={:.0} km, Halo T_xy={:.1} d) ===\n",
+            self.l2_distance_km, self.l2_halo_period_xy_days
+        );
+        out.push_str(&format!(
+            "{:<14} {:<19} {:>7} {:>9} {:>9} {:>10} {:>10}\n",
+            "Target", "Regime", "a(AU)", "dV(km/s)", "C3", "TOF(d)", "AssistSave"
+        ));
+        for r in &self.rows {
+            out.push_str(&format!(
+                "{:<14} {:<19} {:>7.3} {:>9.2} {:>9.1} {:>10.1} {:>10}\n",
+                r.target_id,
+                r.regime,
+                r.semi_major_axis_au,
+                r.transfer_dv_km_s,
+                r.c3_km2_s2,
+                r.time_of_flight_days,
+                if r.dv_saved_km_s > 0.0 {
+                    format!(
+                        "-{:.2} ({})",
+                        r.dv_saved_km_s,
+                        r.best_assist_body.as_deref().unwrap_or("?")
+                    )
+                } else {
+                    "—".to_string()
+                }
+            ));
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::bootstrap_catalog;
+
+    #[test]
+    fn multi_target_budget_includes_l2_and_planetary_hohmann_with_assist_savings() {
+        let catalog = bootstrap_catalog();
+        let report = compute_multi_target_transfer_budget(&[], &catalog);
+        assert_eq!(report.rows.len(), DEFAULT_MISSION_BUDGET_TARGETS.len());
+        assert!((report.l2_distance_km - 1_501_154.0).abs() < 15_000.0);
+
+        let l2 = report
+            .rows
+            .iter()
+            .find(|r| r.target_id == "sun_earth_l2")
+            .expect("sun_earth_l2 row");
+        assert_eq!(l2.regime, "Sun-Earth L2 Halo");
+        assert!(l2.transfer_dv_km_s > 2.5 && l2.transfer_dv_km_s < 4.5);
+        assert!(l2.time_of_flight_days < 120.0);
+
+        let saturn = report
+            .rows
+            .iter()
+            .find(|r| r.target_id == "saturn")
+            .expect("saturn row");
+        assert!(saturn.dv_saved_km_s > 0.5);
+        assert_eq!(saturn.best_assist_body.as_deref(), Some("Jupiter"));
+
+        let csv = report.to_csv();
+        assert!(csv.starts_with("target_id,target_name,category,regime,"));
+        assert_eq!(csv.lines().count(), DEFAULT_MISSION_BUDGET_TARGETS.len() + 1);
+
+        let json_str = report.to_json_pretty().expect("serialize budget JSON");
+        let parsed: MissionTransferBudgetReport =
+            serde_json::from_str(&json_str).expect("deserialize budget JSON");
+        assert_eq!(parsed.rows.len(), report.rows.len());
+    }
 }

@@ -19,7 +19,8 @@
 use clap::{Parser, Subcommand};
 use eframe::egui;
 use helioprobe::astrodynamics_lab::{
-    compute_gravity_assist, compute_porkchop_grid, ASSIST_CANDIDATE_IDS,
+    compute_gravity_assist, compute_multi_target_transfer_budget, compute_porkchop_grid,
+    ASSIST_CANDIDATE_IDS,
 };
 use helioprobe::catalog::bootstrap_catalog;
 use helioprobe::gamification::SaveDatabase;
@@ -65,6 +66,18 @@ enum Commands {
     Porkchop {
         #[arg(default_value = "saturn")]
         target_id: String,
+    },
+    /// Compare multi-target Hohmann and Sun-Earth L2 transfer delta-v & time-of-flight mission budgets
+    Budget {
+        /// Comma-separated catalog target IDs (defaults to Sun-Earth L2 + major planets/moons)
+        #[arg(long)]
+        targets: Option<String>,
+        /// Output format (`table`, `json`, or `csv`)
+        #[arg(long, default_value = "table")]
+        format: String,
+        /// Optional output file path (writes stdout when omitted)
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
     /// List saved campaigns stored in the local SQLite WAL database
     Slots,
@@ -130,6 +143,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
+            Commands::Budget {
+                targets,
+                format,
+                output,
+            } => {
+                let catalog = bootstrap_catalog();
+                let owned_ids: Vec<String> = targets
+                    .as_deref()
+                    .map(|raw| {
+                        raw.split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let id_refs: Vec<&str> = owned_ids.iter().map(String::as_str).collect();
+                let report = compute_multi_target_transfer_budget(&id_refs, &catalog);
+                let rendered = match format.trim().to_ascii_lowercase().as_str() {
+                    "json" => report.to_json_pretty()?,
+                    "csv" => report.to_csv(),
+                    _ => report.format_table(),
+                };
+                if let Some(ref out_path) = output {
+                    if let Some(parent) = out_path.parent() {
+                        if !parent.as_os_str().is_empty() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                    }
+                    std::fs::write(out_path, &rendered)?;
+                    println!(
+                        "Wrote HelioProbe mission budget ({}) to {}",
+                        format,
+                        out_path.display()
+                    );
+                } else {
+                    println!("{rendered}");
+                }
+            }
             Commands::Slots => {
                 let db = SaveDatabase::open(&cli.db)?;
                 let slots = db.list_slots()?;
@@ -170,4 +221,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(move |cc| Ok(Box::new(HelioProbeApp::new(cc, db_path)))),
     )
     .map_err(|e| format!("eframe launch error: {e}").into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_parses_budget_comparator_subcommand() {
+        let parsed = Cli::try_parse_from([
+            "helioprobe",
+            "budget",
+            "--targets",
+            "sun_earth_l2,mars,jupiter",
+            "--format",
+            "csv",
+            "--output",
+            "exports/budget.csv",
+        ])
+        .expect("clap parses budget subcommand");
+        match parsed.command {
+            Some(Commands::Budget {
+                targets,
+                format,
+                output,
+            }) => {
+                assert_eq!(targets.as_deref(), Some("sun_earth_l2,mars,jupiter"));
+                assert_eq!(format, "csv");
+                assert_eq!(output, Some(PathBuf::from("exports/budget.csv")));
+            }
+            other => panic!("Unexpected command: {other:?}"),
+        }
+    }
 }

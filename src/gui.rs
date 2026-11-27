@@ -19,7 +19,8 @@
 //! - Right Dock: 8-tab Science & Engineering Console (`Scanner`, `L2 & Comets`, `Windows`, `Landers`, `Tech Lab`, `Awards`, `Public Data`, `Saves`)
 
 use crate::astrodynamics_lab::{
-    compute_gravity_assist, compute_porkchop_grid_with_offsets, PorkchopGrid, ASSIST_CANDIDATE_IDS,
+    compute_gravity_assist, compute_multi_target_transfer_budget,
+    compute_porkchop_grid_with_offsets, PorkchopGrid, ASSIST_CANDIDATE_IDS,
 };
 use crate::catalog::{bootstrap_catalog, BodyCategory, CelestialBody, ScanBand};
 use crate::gamification::{AchievementDef, CampaignState, SaveDatabase, ACHIEVEMENTS};
@@ -450,6 +451,9 @@ pub struct HelioProbeApp {
     mission_log_open: bool,
     show_about_window: bool,
     focus_catalog_search: bool,
+    pub command_palette_open: bool,
+    command_palette_just_opened: bool,
+    command_palette_query: String,
 }
 
 impl HelioProbeApp {
@@ -520,6 +524,9 @@ impl HelioProbeApp {
             mission_log_open: false,
             show_about_window: false,
             focus_catalog_search: false,
+            command_palette_open: false,
+            command_palette_just_opened: false,
+            command_palette_query: String::new(),
         }
     }
 
@@ -566,6 +573,9 @@ impl HelioProbeApp {
             mission_log_open: false,
             show_about_window: false,
             focus_catalog_search: false,
+            command_palette_open: false,
+            command_palette_just_opened: false,
+            command_palette_query: String::new(),
         }
     }
 
@@ -837,8 +847,19 @@ impl eframe::App for HelioProbeApp {
 impl HelioProbeApp {
     pub fn ui_step(&mut self, ctx: &egui::Context) {
         self.poll_pending_fetch();
+        let toggle_palette = ctx.input_mut(|i| {
+            let cmd_k = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::K);
+            i.consume_shortcut(&cmd_k)
+        });
+        if toggle_palette {
+            self.command_palette_open = !self.command_palette_open;
+            self.command_palette_just_opened = self.command_palette_open;
+        }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if self.show_about_window {
+            if self.command_palette_open {
+                self.command_palette_open = false;
+                self.command_palette_just_opened = false;
+            } else if self.show_about_window {
                 self.show_about_window = false;
             } else if self.mission_log_open {
                 self.mission_log_open = false;
@@ -1188,6 +1209,14 @@ impl HelioProbeApp {
                 ui.checkbox(&mut self.show_labels, "Labels");
                 if ui.button("Quick Save (Slot 1)").clicked() {
                     self.quick_save_slot1();
+                }
+                if ui
+                    .selectable_label(self.command_palette_open, "Palette (Ctrl+K)")
+                    .on_hover_text("Fuzzy quick-jump palette for planets/L2/probes, time warp presets, transfer planner, and exports")
+                    .clicked()
+                {
+                    self.command_palette_open = !self.command_palette_open;
+                    self.command_palette_just_opened = self.command_palette_open;
                 }
             });
         });
@@ -2152,6 +2181,61 @@ impl HelioProbeApp {
                                     }
                                 }
                             }
+
+                            ui.separator();
+                            ui.strong("Multi-Target Hohmann & Sun–Earth L2 Mission Budget");
+                            let budget = compute_multi_target_transfer_budget(&[], &catalog);
+                            ui.small(format!(
+                                "Sun–Earth L2: {:.0} km | Halo T_xy {:.1} d / T_z {:.1} d",
+                                budget.l2_distance_km,
+                                budget.l2_halo_period_xy_days,
+                                budget.l2_halo_period_z_days
+                            ));
+                            egui::Grid::new("helioprobe_budget_grid")
+                                .striped(true)
+                                .spacing([8.0, 2.0])
+                                .show(ui, |ui| {
+                                    ui.small(egui::RichText::new("Target").strong());
+                                    ui.small(egui::RichText::new("dV").strong());
+                                    ui.small(egui::RichText::new("TOF").strong());
+                                    ui.small(egui::RichText::new("Assist").strong());
+                                    ui.end_row();
+                                    for row in &budget.rows {
+                                        if ui
+                                            .selectable_label(
+                                                self.selected_body_id == row.target_id,
+                                                &row.target_name,
+                                            )
+                                            .clicked()
+                                        {
+                                            self.selected_body_id = row.target_id.clone();
+                                        }
+                                        ui.small(format!("{:.2} km/s", row.transfer_dv_km_s));
+                                        ui.small(format!("{:.0} d", row.time_of_flight_days));
+                                        ui.small(if row.dv_saved_km_s > 0.0 {
+                                            format!(
+                                                "-{:.2} ({})",
+                                                row.dv_saved_km_s,
+                                                row.best_assist_body.as_deref().unwrap_or("?")
+                                            )
+                                        } else {
+                                            row.regime
+                                                .split_whitespace()
+                                                .last()
+                                                .unwrap_or("Direct")
+                                                .to_string()
+                                        });
+                                        ui.end_row();
+                                    }
+                                });
+                            ui.horizontal(|ui| {
+                                if ui.small_button("Export Budget CSV...").clicked() {
+                                    self.export_budget_file(&catalog, true);
+                                }
+                                if ui.small_button("Export Budget JSON...").clicked() {
+                                    self.export_budget_file(&catalog, false);
+                                }
+                            });
                         }
                     }
 
@@ -2902,8 +2986,8 @@ impl HelioProbeApp {
                                 ui.strong("O / L");
                                 ui.label("Toggle 3D orbital ribbons / body labels");
                                 ui.end_row();
-                                ui.strong("Ctrl+F");
-                                ui.label("Focus Celestial Target Catalog search box");
+                                ui.strong("Ctrl+F / Ctrl+K");
+                                ui.label("Focus Target Catalog search / Open Command Palette");
                                 ui.end_row();
                                 ui.strong("Space");
                                 ui.label("Pause / resume ephemeris & probe simulation");
@@ -3167,6 +3251,7 @@ impl HelioProbeApp {
             });
 
         ctx.request_repaint();
+        self.render_command_palette(ctx);
     }
 }
 
@@ -3188,6 +3273,361 @@ fn block_on_future<F: std::future::Future>(fut: F) -> F::Output {
             std::task::Poll::Pending => std::thread::yield_now(),
         }
     }
+}
+
+impl HelioProbeApp {
+    fn export_budget_file(&mut self, catalog: &[CelestialBody], as_csv: bool) {
+        let report = compute_multi_target_transfer_budget(&[], catalog);
+        let ext = if as_csv { "csv" } else { "json" };
+        let filter_name = if as_csv { "CSV Budget" } else { "JSON Budget" };
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title("Export Multi-Target Mission Transfer Budget")
+            .add_filter(filter_name, &[ext])
+            .set_file_name(format!("helioprobe_mission_budget.{ext}"))
+            .save_file()
+        {
+            let content = if as_csv {
+                Ok(report.to_csv())
+            } else {
+                report.to_json_pretty()
+            };
+            match content.and_then(|body| {
+                std::fs::write(&path, body).map_err(serde_json::Error::io)
+            }) {
+                Ok(()) => self.set_toast(format!(
+                    "Exported mission transfer budget {} -> {}",
+                    ext.to_ascii_uppercase(),
+                    path.display()
+                )),
+                Err(e) => self.set_toast(format!("Budget export failed: {e}")),
+            }
+        }
+    }
+
+    fn build_palette_entries(&self, catalog: &[CelestialBody]) -> Vec<HelioPaletteEntry> {
+        let mut entries = vec![
+            HelioPaletteEntry {
+                category: "Focus",
+                title: "Sun-Earth L2 Halo Observatories (JWST / Roman)".into(),
+                subtitle: "Select Sun-Earth L2, switch to L2 & Comets tab, and lock camera".into(),
+                action: HelioPaletteAction::FocusBodyAndTab(
+                    "sun_earth_l2".into(),
+                    Some(RightTab::L2AndComets),
+                    CameraTrackMode::LockSelectedBody,
+                ),
+            },
+            HelioPaletteEntry {
+                category: "Camera",
+                title: "Camera 1: Free Solar System Overview".into(),
+                subtitle: "Unlock camera and zoom out to heliocentric overview (Hotkey: 1)".into(),
+                action: HelioPaletteAction::SetCamera(CameraTrackMode::FreeSolarOverview),
+            },
+            HelioPaletteEntry {
+                category: "Camera",
+                title: "Camera 2: Lock Selected Target Body".into(),
+                subtitle: "Track currently selected planet, moon, comet, or L2 point (Hotkey: 2)".into(),
+                action: HelioPaletteAction::SetCamera(CameraTrackMode::LockSelectedBody),
+            },
+            HelioPaletteEntry {
+                category: "Camera",
+                title: "Camera 3: Spacecraft Orbit View".into(),
+                subtitle: "Inspect active orbiting probe around selected body (Hotkey: 3)".into(),
+                action: HelioPaletteAction::SetCamera(CameraTrackMode::OrbitView),
+            },
+            HelioPaletteEntry {
+                category: "Camera",
+                title: "Camera 4: Ride Latest Transit Probe".into(),
+                subtitle: "Follow active interplanetary probe along transfer arc (Hotkey: 4)".into(),
+                action: HelioPaletteAction::SetCamera(CameraTrackMode::RideLatestProbe),
+            },
+            HelioPaletteEntry {
+                category: "Camera",
+                title: "Camera 5: Lander / Ocean Cryobot POV".into(),
+                subtitle: "Inspect surface lander, cryobot, or entry plunge (Hotkey: 5)".into(),
+                action: HelioPaletteAction::SetCamera(CameraTrackMode::LanderBotView),
+            },
+            HelioPaletteEntry {
+                category: "Warp",
+                title: "Toggle Pause / Resume Ephemeris Clock".into(),
+                subtitle: "Pause or resume planetary and spacecraft simulation (Hotkey: Space)".into(),
+                action: HelioPaletteAction::TogglePause,
+            },
+            HelioPaletteEntry {
+                category: "Warp",
+                title: "Time Warp Preset: Real-Time Precision (1.0x / 0.01 d/s)".into(),
+                subtitle: "Slow ephemeris clock and 1x probe transit speed".into(),
+                action: HelioPaletteAction::SetWarp(1.0, 0.01),
+            },
+            HelioPaletteEntry {
+                category: "Warp",
+                title: "Time Warp Preset: Interplanetary Cruise (5.0x / 0.20 d/s)".into(),
+                subtitle: "Medium-fast orbital clock and 5x probe transit warp".into(),
+                action: HelioPaletteAction::SetWarp(5.0, 0.20),
+            },
+            HelioPaletteEntry {
+                category: "Warp",
+                title: "Time Warp Preset: Outer-System Express (10.0x / 1.00 d/s)".into(),
+                subtitle: "Maximum probe transit warp and 1.0 d/s heliocentric clock".into(),
+                action: HelioPaletteAction::SetWarp(10.0, 1.0),
+            },
+            HelioPaletteEntry {
+                category: "Planner",
+                title: "Open Porkchop & Multi-Target Mission Budget Lab".into(),
+                subtitle: "Switch right console to Launch Windows, Lambert Porkchop & L2/Hohmann Budget".into(),
+                action: HelioPaletteAction::SetTab(RightTab::LaunchWindows),
+            },
+            HelioPaletteEntry {
+                category: "Planner",
+                title: "Open Sun–Earth L2 Observatories & Comets Lab".into(),
+                subtitle: "Manage JWST, Nancy Grace Roman, Comet Interceptor, and comet perihelion warps".into(),
+                action: HelioPaletteAction::SetTab(RightTab::L2AndComets),
+            },
+            HelioPaletteEntry {
+                category: "Export",
+                title: "Export Multi-Target Hohmann / L2 Mission Budget CSV...".into(),
+                subtitle: "Save comparative delta-V, C3, TOF, and gravity-assist savings CSV".into(),
+                action: HelioPaletteAction::ExportBudgetCsv,
+            },
+            HelioPaletteEntry {
+                category: "Export",
+                title: "Export Multi-Target Hohmann / L2 Mission Budget JSON...".into(),
+                subtitle: "Save comparative delta-V, C3, TOF, and L2 dynamics JSON".into(),
+                action: HelioPaletteAction::ExportBudgetJson,
+            },
+            HelioPaletteEntry {
+                category: "Export",
+                title: "Export Campaign Save JSON...".into(),
+                subtitle: "Write portable JSON campaign state to disk".into(),
+                action: HelioPaletteAction::ExportCampaignJson,
+            },
+            HelioPaletteEntry {
+                category: "Save",
+                title: "Quick Save Campaign to SQLite Slot 1 (F5)".into(),
+                subtitle: "Persist active probes, scans, and science points to SQLite WAL".into(),
+                action: HelioPaletteAction::QuickSave,
+            },
+        ];
+
+        for probe in &self.state.probes {
+            entries.push(HelioPaletteEntry {
+                category: "Probe",
+                title: format!("Ride Probe: {} -> {}", probe.callsign, probe.target_name),
+                subtitle: format!("Phase: {:?} | Bus: {}", probe.phase, probe.bus.label()),
+                action: HelioPaletteAction::FocusProbe(probe.id),
+            });
+        }
+
+        for body in catalog {
+            entries.push(HelioPaletteEntry {
+                category: "Body",
+                title: format!("Focus {} ({})", body.name, body.designation),
+                subtitle: format!(
+                    "{:?} | a = {:.3} AU | e = {:.3}",
+                    body.category, body.semi_major_axis_au, body.eccentricity
+                ),
+                action: HelioPaletteAction::FocusBodyAndTab(
+                    body.id.clone(),
+                    None,
+                    CameraTrackMode::LockSelectedBody,
+                ),
+            });
+        }
+        entries
+    }
+
+    fn apply_palette_action(&mut self, action: &HelioPaletteAction, catalog: &[CelestialBody]) {
+        match action {
+            HelioPaletteAction::FocusBodyAndTab(id, tab_opt, cam_mode) => {
+                self.selected_body_id = id.clone();
+                self.set_camera_mode(*cam_mode);
+                if let Some(tab) = tab_opt {
+                    self.right_tab = *tab;
+                }
+            }
+            HelioPaletteAction::FocusProbe(pid) => {
+                self.tracked_probe_id = Some(*pid);
+                self.set_camera_mode(CameraTrackMode::RideLatestProbe);
+            }
+            HelioPaletteAction::SetCamera(mode) => {
+                self.set_camera_mode(*mode);
+            }
+            HelioPaletteAction::TogglePause => {
+                self.paused = !self.paused;
+            }
+            HelioPaletteAction::SetWarp(warp, days_s) => {
+                self.transit_warp = *warp;
+                self.ephemeris_days_per_sec = *days_s;
+                self.paused = false;
+                self.set_toast(format!("Set Transit Warp {warp:.1}x & Clock {days_s:.2} d/s"));
+            }
+            HelioPaletteAction::SetTab(tab) => {
+                self.right_tab = *tab;
+            }
+            HelioPaletteAction::ExportBudgetCsv => {
+                self.export_budget_file(catalog, true);
+            }
+            HelioPaletteAction::ExportBudgetJson => {
+                self.export_budget_file(catalog, false);
+            }
+            HelioPaletteAction::ExportCampaignJson => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("JSON Campaign", &["json"])
+                    .set_file_name("helioprobe_campaign_save.json")
+                    .save_file()
+                {
+                    self.json_export_path = path.display().to_string();
+                    match export_campaign_json(&self.state, &path) {
+                        Ok(()) => self.set_toast(format!("Exported campaign JSON to {}", path.display())),
+                        Err(e) => self.set_toast(format!("Export failed: {e}")),
+                    }
+                }
+            }
+            HelioPaletteAction::QuickSave => {
+                self.quick_save_slot1();
+            }
+        }
+    }
+
+    fn render_command_palette(&mut self, ctx: &egui::Context) {
+        if !self.command_palette_open {
+            return;
+        }
+        let mut keep_open = true;
+        let enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+        let catalog = self.full_catalog();
+        let entries = self.build_palette_entries(&catalog);
+        let q = self.command_palette_query.trim();
+        let mut scored: Vec<(i32, usize)> = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, e)| {
+                let hay = format!("{} {} {}", e.category, e.title, e.subtitle);
+                fuzzy_match_score(q, &hay).map(|s| (s, idx))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+        let mut activated: Option<HelioPaletteAction> = None;
+        egui::Window::new("Quick-Jump Mission & Transfer Palette (Ctrl+K)")
+            .open(&mut keep_open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(560.0)
+            .anchor(egui::Align2::CENTER_TOP, egui::Vec2::new(0.0, 52.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Search:").strong());
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.command_palette_query)
+                            .id(egui::Id::new("helioprobe_command_palette_input"))
+                            .hint_text("Type planet, L2, probe, time warp, porkchop, or export...")
+                            .desired_width(430.0),
+                    );
+                    if self.command_palette_just_opened {
+                        resp.request_focus();
+                        self.command_palette_just_opened = false;
+                    }
+                    if ui.small_button("Clear").clicked() {
+                        self.command_palette_query.clear();
+                        resp.request_focus();
+                    }
+                });
+                ui.separator();
+
+                let first_match = scored.first().map(|&(_, idx)| entries[idx].action.clone());
+                egui::ScrollArea::vertical()
+                    .max_height(350.0)
+                    .show(ui, |ui| {
+                        if scored.is_empty() {
+                            ui.small("No matching bodies, L2 observatories, warps, or exports.");
+                        } else {
+                            for &(_, idx) in scored.iter().take(16) {
+                                let entry = &entries[idx];
+                                let resp = ui
+                                    .selectable_label(
+                                        false,
+                                        format!("[{}] {}", entry.category, entry.title),
+                                    )
+                                    .on_hover_text(&entry.subtitle);
+                                ui.small(
+                                    egui::RichText::new(&entry.subtitle)
+                                        .color(egui::Color32::from_rgb(148, 163, 184)),
+                                );
+                                ui.add_space(2.0);
+                                if resp.clicked() {
+                                    activated = Some(entry.action.clone());
+                                }
+                            }
+                        }
+                    });
+
+                if activated.is_none() && enter_pressed {
+                    activated = first_match;
+                }
+            });
+
+        if !keep_open {
+            self.command_palette_open = false;
+            self.command_palette_just_opened = false;
+        }
+        if let Some(action) = activated {
+            self.apply_palette_action(&action, &catalog);
+            self.command_palette_open = false;
+            self.command_palette_just_opened = false;
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum HelioPaletteAction {
+    FocusBodyAndTab(String, Option<RightTab>, CameraTrackMode),
+    FocusProbe(u64),
+    SetCamera(CameraTrackMode),
+    TogglePause,
+    SetWarp(f64, f64),
+    SetTab(RightTab),
+    ExportBudgetCsv,
+    ExportBudgetJson,
+    ExportCampaignJson,
+    QuickSave,
+}
+
+#[derive(Debug, Clone)]
+struct HelioPaletteEntry {
+    category: &'static str,
+    title: String,
+    subtitle: String,
+    action: HelioPaletteAction,
+}
+
+fn fuzzy_match_score(query: &str, text: &str) -> Option<i32> {
+    let q = query.trim().to_ascii_lowercase();
+    if q.is_empty() {
+        return Some(0);
+    }
+    let t = text.to_ascii_lowercase();
+    if let Some(pos) = t.find(&q) {
+        return Some(1000 - pos as i32);
+    }
+    let mut t_chars = t.char_indices();
+    let mut score = 200i32;
+    let mut prev_idx: Option<usize> = None;
+    for qc in q.chars() {
+        if qc.is_whitespace() {
+            continue;
+        }
+        let found = t_chars.find(|&(_, tc)| tc == qc);
+        match found {
+            Some((idx, _)) => {
+                if let Some(prev) = prev_idx {
+                    score -= (idx.saturating_sub(prev + 1)) as i32;
+                }
+                prev_idx = Some(idx);
+            }
+            None => return None,
+        }
+    }
+    Some(score)
 }
 
 fn write_rgba_png(
@@ -3859,5 +4299,65 @@ mod tests {
         let c1 = porkchop_colormap(1.0);
         assert_eq!(c0, egui::Color32::from_rgb(68, 1, 84));
         assert_eq!(c1, egui::Color32::from_rgb(253, 231, 37));
+    }
+
+    #[test]
+    fn command_palette_ctrl_k_focuses_l2_applies_warp_and_closes_on_escape() {
+        let ctx = egui::Context::default();
+        let mut app = HelioProbeApp::new_headless(PathBuf::from("test_palette_ctrl_k.db"));
+        assert!(!app.command_palette_open);
+
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1400.0, 900.0),
+                )),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::K,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                }],
+                ..Default::default()
+            },
+            |c| app.ui_step(c),
+        );
+        assert!(app.command_palette_open, "Ctrl+K must open command palette");
+
+        let catalog = app.full_catalog();
+        let entries = app.build_palette_entries(&catalog);
+        let l2_entry = entries
+            .iter()
+            .filter_map(|e| {
+                let hay = format!("{} {} {}", e.category, e.title, e.subtitle);
+                fuzzy_match_score("sun-earth l2 halo", &hay).map(|s| (s, e))
+            })
+            .max_by_key(|x| x.0)
+            .expect("Sun-Earth L2 entry")
+            .1
+            .clone();
+        app.apply_palette_action(&l2_entry.action, &catalog);
+        assert_eq!(app.selected_body_id, "sun_earth_l2");
+        assert_eq!(app.right_tab, RightTab::L2AndComets);
+
+        let warp_entry = entries
+            .iter()
+            .filter_map(|e| {
+                let hay = format!("{} {} {}", e.category, e.title, e.subtitle);
+                fuzzy_match_score("outer-system express", &hay).map(|s| (s, e))
+            })
+            .max_by_key(|x| x.0)
+            .expect("warp preset entry")
+            .1
+            .clone();
+        app.apply_palette_action(&warp_entry.action, &catalog);
+        assert!((app.transit_warp - 10.0).abs() < 1e-6);
+        assert!((app.ephemeris_days_per_sec - 1.0).abs() < 1e-6);
+
+        // Escape dismisses palette
+        run_key_frame(&ctx, &mut app, Some(egui::Key::Escape));
+        assert!(!app.command_palette_open, "Escape must dismiss command palette");
     }
 }
